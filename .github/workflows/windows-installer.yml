@@ -1,0 +1,55 @@
+name: Build Windows installer
+
+on:
+  push:
+    branches:
+      - build/windows-installer
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Run timeout regression tests
+        run: cargo test -p cursor-server block_until_ms
+
+      - name: Build NSIS installer
+        working-directory: apps/desktop
+        shell: pwsh
+        run: npm run tauri -- build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-windows | Out-Null
+          Copy-Item target/release/bundle/nsis/*.exe dist-windows/
+          Copy-Item target/release/cursor-byok-desktop.exe dist-windows/
+          Get-ChildItem dist-windows
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cursor-byok-windows-x86_64
+          path: dist-windows/*
+          if-no-files-found: error
+          retention-days: 7
