@@ -144,6 +144,7 @@ impl CursorHarness {
 
     pub async fn set_tab_settings(&self, settings: TabSettings) -> Result<TabSettings> {
         let saved = self.inner.store.set_tab_settings(settings).await?;
+        account::prepare_for_tab_mode(saved.mode).await?;
         *self.inner.tab_mode.write() = saved.mode;
         Ok(saved)
     }
@@ -159,16 +160,17 @@ impl CursorHarness {
             .backend_addr
             .read()
             .ok_or_else(|| Error::Config("desktop management server is not ready".into()))?;
+        let tab_mode = self.inner.store.tab_settings().await?.mode;
+        *self.inner.tab_mode.write() = tab_mode;
         let mut proxy = self.inner.proxy.lock().await;
         if proxy.running() {
             if let Some(url) = proxy.url() {
-                apply_cursor_configuration(&url).await?;
+                apply_cursor_configuration(&url, tab_mode).await?;
             }
             return Ok(());
         }
         let ca = self.inner.ca.load()?;
         let requested_port = self.inner.store.port_settings().await?.proxy_port;
-        *self.inner.tab_mode.write() = self.inner.store.tab_settings().await?.mode;
         let (url, actual_port) = proxy
             .start(
                 backend_addr,
@@ -181,7 +183,7 @@ impl CursorHarness {
             proxy.stop().await;
             return Err(error);
         }
-        if let Err(error) = apply_cursor_configuration(&url).await {
+        if let Err(error) = apply_cursor_configuration(&url, tab_mode).await {
             proxy.stop().await;
             return Err(error);
         }
@@ -195,8 +197,8 @@ impl CursorHarness {
     }
 }
 
-async fn apply_cursor_configuration(proxy_url: &str) -> Result<()> {
-    account::inject_if_missing().await?;
+async fn apply_cursor_configuration(proxy_url: &str, tab_mode: TabMode) -> Result<()> {
+    account::prepare_for_tab_mode(tab_mode).await?;
     settings::write_proxy_settings(proxy_url)
 }
 
