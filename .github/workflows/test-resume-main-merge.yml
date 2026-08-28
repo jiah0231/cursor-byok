@@ -1,0 +1,27 @@
+name: Validate merged ResumeAction fix
+
+on:
+  push:
+    branches:
+      - test/resume-main-merge
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run ResumeAction regression
+        run: cargo test -p cursor-server --test resume_progress -- --nocapture
+      - name: Test cursor-server
+        run: cargo test -p cursor-server --all-targets
