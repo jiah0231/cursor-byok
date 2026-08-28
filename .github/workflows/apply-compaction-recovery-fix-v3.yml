@@ -1,0 +1,144 @@
+name: Complete compaction recovery verification
+
+on:
+  push:
+    branches:
+      - fix/compaction-recovery-threshold
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Complete source patch
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          # Reuse v2 up to its known test-import matcher failure. All source
+          # mutations before SystemExit remain in this Actions workspace.
+          workflow = Path(".github/workflows/apply-compaction-recovery-fix-v2.yml").read_text()
+          marker = "      - name: Apply fixes robustly\n        shell: python\n        run: |\n"
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index("\n      - name: Format", start)
+          block = workflow[start:end]
+          script = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in block.splitlines()
+          )
+          try:
+              exec(compile(script, "v2-compaction-patch", "exec"), {})
+          except SystemExit as error:
+              if str(error) != "engine test import block did not match":
+                  raise
+
+          engine_path = Path("server/src/run/engine.rs")
+          engine = engine_path.read_text()
+
+          old_import = (
+              "    use super::{\n"
+              "        auto_compaction_partition, estimate_context_tokens, hydrate_tool_images,\n"
+              "        should_auto_compact, ContextUsageAnchor,\n"
+              "    };\n"
+          )
+          new_import = (
+              "    use super::{\n"
+              "        auto_compaction_allowed, auto_compaction_partition, compaction_input_limit,\n"
+              "        hydrate_tool_images, should_auto_compact, ContextUsageAnchor,\n"
+              "    };\n"
+          )
+          if engine.count(old_import) != 1:
+              raise SystemExit(f"engine test import exact match count: {engine.count(old_import)}")
+          engine = engine.replace(old_import, new_import, 1)
+
+          old_model_import = (
+              "            CanonicalMessage, ContentPart, ConversationId, ModelSpec, Origin, PreparedRun,\n"
+          )
+          new_model_import = (
+              "            estimate_context_tokens, CanonicalMessage, ContentPart, ConversationId,\n"
+              "            ModelSpec, Origin, PreparedRun,\n"
+          )
+          if engine.count(old_model_import) != 1:
+              raise SystemExit(f"engine model import exact match count: {engine.count(old_model_import)}")
+          engine = engine.replace(old_model_import, new_model_import, 1)
+
+          # Extract the intended threshold unit tests from the original patch.
+          legacy = Path(".github/workflows/apply-compaction-recovery-fix.yml").read_text()
+          legacy_start = legacy.index("        run: |\n") + len("        run: |\n")
+          legacy_end = legacy.index("\n      - name: Format", legacy_start)
+          legacy_block = legacy[legacy_start:legacy_end]
+          legacy_script = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in legacy_block.splitlines()
+          )
+          tests_match = re.search(
+              r"tests = r'''(.*?)'''\.replace\(\"          \", \"\", 1\)",
+              legacy_script,
+              re.S,
+          )
+          if not tests_match:
+              raise SystemExit("could not extract threshold unit tests")
+          tests = tests_match.group(1).replace("          ", "", 1)
+          insertion = "    #[test]\n    fn auto_compaction_preserves_only_the_latest_request_context() {\n"
+          if engine.count(insertion) != 1:
+              raise SystemExit(f"engine unit test insertion marker count: {engine.count(insertion)}")
+          engine = engine.replace(insertion, tests + insertion, 1)
+          engine_path.write_text(engine)
+
+          # Extract the end-to-end compaction failure/recovery regression.
+          test_prefix = 'Path("server/tests/compaction_recovery.rs").write_text(r\'\'\''
+          test_start = legacy_script.index(test_prefix) + len(test_prefix)
+          test_end = legacy_script.index("'''.replace(\"          \", \"\", 1))", test_start)
+          recovery_test = legacy_script[test_start:test_end].replace("          ", "", 1)
+          Path("server/tests/compaction_recovery.rs").write_text(recovery_test)
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run compaction recovery regression
+        run: cargo test -p cursor-server --test compaction_recovery -- --nocapture
+
+      - name: Run existing compaction tests
+        run: cargo test -p cursor-server --test compaction -- --nocapture
+
+      - name: Run resume regression
+        run: cargo test -p cursor-server --test resume_progress -- --nocapture
+
+      - name: Run removed-tool regression
+        run: cargo test -p cursor-server --test removed_tool_compat -- --nocapture
+
+      - name: Test cursor-server
+        run: cargo test -p cursor-server --all-targets
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+      - name: Commit tested fix and remove temporary workflows
+        shell: bash
+        run: |
+          rm .github/workflows/apply-compaction-recovery-fix.yml
+          rm .github/workflows/apply-compaction-recovery-fix-v2.yml
+          rm .github/workflows/apply-compaction-recovery-fix-v3.yml
+          git add -A
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix: make compaction durable and threshold-aware"
+          git push
