@@ -163,6 +163,84 @@ async fn compacted_checkpoint_survives_followup_error_and_resume_continues() {
     assert_eq!(requests[3].history.last().unwrap().role, Role::User);
 }
 
+#[tokio::test]
+async fn resume_action_auto_compacts_large_recovered_state_without_new_user_message() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let model = store
+        .create_model(&ModelConfigInput {
+            sort_order: 0,
+            display_name: "Resume Threshold".into(),
+            model_type: ModelType::OpenAi,
+            base_url: "https://example.com/v1/chat/completions".into(),
+            use_full_url: true,
+            api_key: "test-key".into(),
+            tooltip_data: "Resume Threshold".into(),
+            model_id: "resume-threshold".into(),
+            reasoning_effort: None,
+            openai_endpoint: OPENAI_CHAT_ENDPOINT.into(),
+            openai_extra_params_enabled: false,
+            openai_extra_params: serde_json::json!({}),
+            custom_headers_enabled: false,
+            custom_headers: serde_json::json!({}),
+            anthropic_extra_params_enabled: false,
+            anthropic_extra_params: serde_json::json!({}),
+            context_window_tokens: Some(30_000),
+            max_completion_tokens: Some(4_000),
+            anthropic_max_tokens: None,
+            anthropic_thinking_effort: None,
+            thinking_budget_tokens: None,
+        })
+        .await
+        .unwrap();
+    let provider = fake_provider::FakeProvider::default();
+    provider.push(text_response("x".repeat(100_000), 1_000, 25_000));
+    provider.push(text_response("resume summary marker", 26_000, 100));
+    provider.push(text_response(
+        "continued after resume compaction",
+        2_000,
+        20,
+    ));
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = CursorSessionRegistry::new(
+        store.clone(),
+        Arc::new(provider.clone()),
+        PromptCompiler::new(assets),
+        Default::default(),
+    );
+    let first = run(
+        &registry,
+        "resume-large-first",
+        user_request(
+            "resume-large-conversation",
+            "resume-user",
+            "start long work",
+            &model.model_hash,
+            None,
+        ),
+    )
+    .await;
+    assert!(first.end_error.is_none());
+    let state = first.checkpoints.last().unwrap().clone();
+    let resumed = run(
+        &registry,
+        "resume-large-second",
+        resume_request("resume-large-conversation", &model.model_hash, state),
+    )
+    .await;
+    assert!(resumed.end_error.is_none());
+    assert_eq!(resumed.summary_started, 1);
+    assert_eq!(resumed.summary_completed, 1);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].prompt.tools.is_empty());
+    assert!(history_text(&requests[2].history).contains("resume summary marker"));
+}
+
 async fn record_threshold_anchor(
     store: &cursor_server::store::Store,
     model: &cursor_server::model::ModelConfig,

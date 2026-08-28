@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use tokio_util::sync::CancellationToken;
 
@@ -19,8 +19,9 @@ use crate::{
 use super::{consume_model_cycle, ModelCycleFailure, RunFailure, RunOutcome};
 
 const COMPACTION_MIN_RESERVE_TOKENS: u64 = 10_000;
-const COMPACTION_OUTPUT_TOKENS: u64 = 4_096;
+const COMPACTION_OUTPUT_TOKENS: u64 = 2_048;
 const COMPACTION_OUTPUT_SAFETY_TOKENS: u64 = 4_096;
+const AUTO_COMPACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPACTION_FALLBACK_CHARS: usize = 12_000;
 const COMPACTION_INSTRUCTIONS: &str = "Summarize the conversation for the next model turn. Preserve goals, constraints, decisions, files, commands, errors, results, and unfinished work. Do not call tools. Return only the concise durable summary.";
 
@@ -172,6 +173,7 @@ impl RunEngine {
         }
 
         let mut last_auto_compaction_revision = None;
+        let mut provider_completed_this_run = false;
         'model: loop {
             if cancellation.is_cancelled() {
                 return (RunOutcome::Cancelled, usage);
@@ -182,7 +184,11 @@ impl RunEngine {
             };
             let can_auto_compact =
                 auto_compaction_allowed(&prepared.action, revision, last_auto_compaction_revision);
-            let context_anchor = if can_auto_compact {
+            // Do not carry a stale pre-compaction usage anchor across a Resume boundary.
+            // Direct estimation still catches a genuinely oversized recovered state.
+            let may_use_usage_anchor =
+                prepared.action == RunAction::Start || provider_completed_this_run;
+            let context_anchor = if can_auto_compact && may_use_usage_anchor {
                 match self
                     .store
                     .latest_llm_call_usage_anchor(
@@ -344,6 +350,7 @@ impl RunEngine {
                     return (RunOutcome::Failed(failure), usage);
                 }
             };
+            provider_completed_this_run = true;
             if let Some(cycle_usage) = cycle.usage {
                 accumulate_usage(&mut usage, cycle_usage);
             }
@@ -564,6 +571,7 @@ impl RunEngine {
         let drain = tokio::spawn(async move { while discarded_events.recv().await.is_some() {} });
         let mut pending_insertions = Vec::new();
         let mut interrupted_message = None;
+        let mut compaction_timed_out = false;
         let cycle = {
             let cycle = consume_model_cycle(
                 self.provider.stream(invocation, cycle_cancellation.clone()),
@@ -571,6 +579,8 @@ impl RunEngine {
                 &cycle_cancellation,
             );
             tokio::pin!(cycle);
+            let timeout = tokio::time::sleep(AUTO_COMPACTION_TIMEOUT);
+            tokio::pin!(timeout);
             loop {
                 tokio::select! {
                     biased;
@@ -581,12 +591,12 @@ impl RunEngine {
                         Some(ClientCommand::InterruptWithMessage(message)) => {
                             cycle_cancellation.cancel();
                             interrupted_message = Some(message);
-                            break cycle.await;
+                            break Some(cycle.await);
                         }
                         Some(ClientCommand::RuntimeEvent(event)) => {
                             cycle_cancellation.cancel();
                             interrupted_message = Some(event.into_message());
-                            break cycle.await;
+                            break Some(cycle.await);
                         }
                         Some(ClientCommand::Cancel) => {
                             cycle_cancellation.cancel();
@@ -607,25 +617,54 @@ impl RunEngine {
                             return Err(client_failure());
                         }
                     },
-                    result = &mut cycle => break result,
+                    result = &mut cycle => break Some(result),
+                    _ = &mut timeout => {
+                        compaction_timed_out = true;
+                        cycle_cancellation.cancel();
+                        break None;
+                    },
                 }
             }
         };
         drop(silent_events);
         let _ = drain.await;
-        let (summary, compaction_usage) = match (interrupted_message.is_some(), cycle) {
-            (true, Ok(cycle)) => (fallback_summary(&compactable), cycle.usage),
-            (true, Err(failure)) => (fallback_summary(&compactable), failure.usage),
-            (false, Ok(cycle)) if cycle.calls.is_empty() && !cycle.text.trim().is_empty() => {
+        let (summary, compaction_usage) = match (
+            interrupted_message.is_some(),
+            compaction_timed_out,
+            cycle,
+        ) {
+            (false, true, timed_out_cycle) => {
+                tracing::warn!(
+                    timeout_seconds = AUTO_COMPACTION_TIMEOUT.as_secs(),
+                    "automatic compaction timed out; using fallback"
+                );
+                (
+                    fallback_summary(&compactable),
+                    match timed_out_cycle {
+                        Some(Ok(cycle)) => cycle.usage,
+                        Some(Err(failure)) => failure.usage,
+                        None => None,
+                    },
+                )
+            }
+            (true, _, Some(Ok(cycle))) => (fallback_summary(&compactable), cycle.usage),
+            (true, _, Some(Err(failure))) => (fallback_summary(&compactable), failure.usage),
+            (false, false, Some(Ok(cycle)))
+                if cycle.calls.is_empty() && !cycle.text.trim().is_empty() =>
+            {
                 (cycle.text.trim().to_string(), cycle.usage)
             }
-            (false, Ok(cycle)) => {
+            (false, false, Some(Ok(cycle))) => {
                 tracing::warn!("automatic compaction returned no usable summary; using fallback");
                 (fallback_summary(&compactable), cycle.usage)
             }
-            (false, Err(failure)) => {
+            (false, false, Some(Err(failure))) => {
                 tracing::warn!(error = ?failure.failure, "automatic compaction model failed; using fallback");
                 (fallback_summary(&compactable), failure.usage)
+            }
+            (_, _, None) => {
+                tracing::warn!("automatic compaction ended without a model result; using fallback");
+                (fallback_summary(&compactable), None)
             }
         };
         let event_id = format!("summary:auto:{}", prepared.run_id);
@@ -740,7 +779,7 @@ fn auto_compaction_allowed(
     revision: crate::model::RevisionId,
     last_auto_compaction_revision: Option<crate::model::RevisionId>,
 ) -> bool {
-    *action == RunAction::Start && last_auto_compaction_revision != Some(revision)
+    !matches!(action, RunAction::Compact) && last_auto_compaction_revision != Some(revision)
 }
 
 fn compaction_input_limit(prepared: &PreparedRun) -> Option<u64> {
@@ -759,7 +798,7 @@ fn should_auto_compact(
     messages: &[CanonicalMessage],
     anchor: Option<ContextUsageAnchor>,
 ) -> bool {
-    if prepared.action != RunAction::Start || messages.len() <= prepared.initial_messages.len() {
+    if prepared.action == RunAction::Compact || messages.len() <= prepared.initial_messages.len() {
         return false;
     }
     let Some(input_limit) = compaction_input_limit(prepared) else {
@@ -1132,6 +1171,13 @@ mod tests {
             RevisionId(3),
             Some(RevisionId(2)),
         ));
+        assert!(auto_compaction_allowed(
+            &RunAction::Resume {
+                pending_tool_round: None
+            },
+            RevisionId(3),
+            Some(RevisionId(2)),
+        ));
         assert!(!auto_compaction_allowed(
             &RunAction::Compact,
             RevisionId(3),
@@ -1213,6 +1259,13 @@ mod tests {
         ));
         assert!(auto_compaction_allowed(
             &RunAction::Start,
+            RevisionId(11),
+            Some(RevisionId(10))
+        ));
+        assert!(auto_compaction_allowed(
+            &RunAction::Resume {
+                pending_tool_round: None
+            },
             RevisionId(11),
             Some(RevisionId(10))
         ));
