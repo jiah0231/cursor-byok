@@ -1,0 +1,76 @@
+name: Verify runtime compaction patch v4
+on:
+  push:
+    branches: [fix/compaction-during-resume-timeout]
+    paths: [.github/workflows/patch-compaction-runtime-v4.yml]
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/compaction-during-resume-timeout
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply runtime patch
+        run: |
+          python -m pip install --quiet pyyaml
+          python - <<'PY'
+          import yaml
+          from pathlib import Path
+          wf = yaml.safe_load(Path('.github/workflows/patch-compaction-runtime.yml').read_text())
+          steps = wf['jobs']['patch-test-commit']['steps']
+          exec(compile(next(x['run'] for x in steps if x.get('name') == 'Patch runtime compaction'), '<patch>', 'exec'), {})
+          exec(compile(next(x['run'] for x in steps if x.get('name') == 'Add Resume compaction regression test'), '<test>', 'exec'), {})
+          p = Path('server/src/run/engine.rs')
+          s = p.read_text()
+          needle = '''            (false, true, None) => {
+                  tracing::warn!(
+                      timeout_seconds = AUTO_COMPACTION_TIMEOUT.as_secs(),
+                      "automatic compaction timed out; using fallback"
+                  );
+                  (fallback_summary(&compactable), None)
+              }'''
+          replacement = '''            (false, true, timed_out_cycle) => {
+                  tracing::warn!(
+                      timeout_seconds = AUTO_COMPACTION_TIMEOUT.as_secs(),
+                      "automatic compaction timed out; using fallback"
+                  );
+                  let timed_out_usage = match timed_out_cycle {
+                      Some(Ok(cycle)) => cycle.usage,
+                      Some(Err(failure)) => failure.usage,
+                      None => None,
+                  };
+                  (fallback_summary(&compactable), timed_out_usage)
+              }'''
+          assert needle in s
+          p.write_text(s.replace(needle, replacement, 1))
+          PY
+      - name: Format
+        run: cargo fmt --all
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Resume and recovery E2E
+        run: cargo test -p cursor-server --test compaction_recovery -- --nocapture
+      - name: Engine unit tests
+        run: cargo test -p cursor-server run::engine::tests -- --nocapture
+      - name: Existing compaction tests
+        run: cargo test -p cursor-server --test compaction -- --nocapture
+      - name: Resume regression
+        run: cargo test -p cursor-server --test resume_progress -- --nocapture
+      - name: Full server suite
+        run: cargo test -p cursor-server --all-targets
+      - name: Diff check
+        run: git diff --check
+      - name: Commit verified changes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add server/src/run/engine.rs server/tests/compaction_recovery.rs
+          git commit -m "fix: compact during resume and bound summary latency"
+          git push origin HEAD:fix/compaction-during-resume-timeout
