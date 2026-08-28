@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, HashSet};
 
 use cursor_server::{
-    cursor::tools::{runtime::{CursorToolRuntime, ExecContext}, ToolBatchState, ToolDispatcher},
+    cursor::tools::{
+        runtime::{CursorToolRuntime, ExecContext},
+        ToolBatchState, ToolDispatcher,
+    },
     model::ToolCall,
 };
 
@@ -20,7 +23,9 @@ fn tool(name: &str) -> ToolCall {
     }
 }
 
-async fn dispatch(name: &str) -> cursor_server::Result<cursor_server::cursor::tools::DispatchedTool> {
+async fn dispatch(
+    name: &str,
+) -> cursor_server::Result<cursor_server::cursor::tools::DispatchedTool> {
     let dispatcher = ToolDispatcher::new(CursorToolRuntime::default());
     let completed = HashSet::new();
     let started = HashSet::new();
@@ -46,7 +51,11 @@ async fn dispatch(name: &str) -> cursor_server::Result<cursor_server::cursor::to
 async fn resumed_await_shell_becomes_a_failed_tool_result_instead_of_a_protocol_error() {
     let dispatched = dispatch("AwaitShell").await.unwrap();
 
-    assert_eq!(dispatched.messages.len(), 1, "started card is still published");
+    assert_eq!(
+        dispatched.messages.len(),
+        1,
+        "started card is still published"
+    );
     let completion = dispatched.completion.expect("compatibility completion");
     assert!(completion.result().is_error);
     assert!(completion.result().content.contains("older version"));
@@ -56,7 +65,11 @@ async fn resumed_await_shell_becomes_a_failed_tool_result_instead_of_a_protocol_
 async fn hallucinated_unknown_tool_becomes_a_failed_tool_result_instead_of_a_protocol_error() {
     let dispatched = dispatch("OldTool").await.unwrap();
 
-    assert_eq!(dispatched.messages.len(), 1, "started card is still published");
+    assert_eq!(
+        dispatched.messages.len(),
+        1,
+        "started card is still published"
+    );
     let completion = dispatched.completion.expect("compatibility completion");
     assert!(completion.result().is_error);
     assert!(completion.result().content.contains("not available"));
