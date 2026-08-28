@@ -28,6 +28,7 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
+          import re
 
           # Execute the now-working v3 source patch in this workspace.
           workflow = Path(".github/workflows/apply-compaction-recovery-fix-v3.yml").read_text()
@@ -50,19 +51,36 @@ jobs:
           # Use zero prior messages so the anchor is always valid, while the
           # 132k authoritative provider input remains between the new dynamic
           # limit (129,904) and the old fixed 140k limit.
-          old = """            prior_message_count,\n            first_request.prompt.tools.len(),\n"""
-          new = """            0,\n            first_request.prompt.tools.len(),\n"""
-          if test.count(old) != 1:
-              raise SystemExit(f"threshold anchor call match count: {test.count(old)}")
-          test = test.replace(old, new, 1)
+          test, count = re.subn(
+              r"(?m)^(\s*)prior_message_count,\n\s*first_request\.prompt\.tools\.len\(\),$",
+              lambda match: f"{match.group(1)}0,\n{match.group(1)}first_request.prompt.tools.len(),",
+              test,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f"threshold anchor call regex count: {count}")
 
-          # Remove the no-longer-needed persisted count and unused import.
-          count_block = """    let prior_message_count = store\n        .load_current_messages(&ConversationId::new(\n            \"compaction-recovery-conversation\",\n        ))\n        .await\n        .unwrap()\n        .len();\n"""
-          if test.count(count_block) != 1:
-              raise SystemExit(f"prior message count block match count: {test.count(count_block)}")
-          test = test.replace(count_block, "", 1)
-          test = test.replace("ContentPart, ConversationId, ModelConfigInput, ModelType, NewLlmCall,", "ContentPart, ModelConfigInput, ModelType, NewLlmCall,", 1)
-          test = test.replace("ProjectedContent, ProjectedMessage, ProviderType, Role, Usage,", "ProjectedContent, ProjectedMessage, Role, Usage,", 1)
+          # Remove the no-longer-needed persisted count regardless of the
+          # temporary workflow's indentation.
+          test, count = re.subn(
+              r"(?ms)^\s*let prior_message_count = store\n\s*\.load_current_messages\(&ConversationId::new\(\n\s*\"compaction-recovery-conversation\",\n\s*\)\)\n\s*\.await\n\s*\.unwrap\(\)\n\s*\.len\(\);\n",
+              "",
+              test,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f"prior message count regex count: {count}")
+
+          test = test.replace(
+              "ContentPart, ConversationId, ModelConfigInput, ModelType, NewLlmCall,",
+              "ContentPart, ModelConfigInput, ModelType, NewLlmCall,",
+              1,
+          )
+          test = test.replace(
+              "ProjectedContent, ProjectedMessage, ProviderType, Role, Usage,",
+              "ProjectedContent, ProjectedMessage, Role, Usage,",
+              1,
+          )
           test_path.write_text(test)
 
           engine = Path("server/src/run/engine.rs").read_text()
