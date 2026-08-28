@@ -30,7 +30,6 @@ jobs:
           from pathlib import Path
           import re
 
-          # Execute the source patch assembled by v3 in this workspace.
           workflow = Path(".github/workflows/apply-compaction-recovery-fix-v3.yml").read_text()
           marker = "      - name: Complete source patch\n        shell: python\n        run: |\n"
           start = workflow.index(marker) + len(marker)
@@ -44,11 +43,6 @@ jobs:
 
           test_path = Path("server/tests/compaction_recovery.rs")
           test = test_path.read_text()
-
-          # Keep the synthetic usage anchor unquestionably valid. The 132.1k
-          # provider input is above the new output-aware limit (129,904) but
-          # below the old fixed-10k limit (140,000), so this E2E test proves
-          # the threshold behavior changed for the intended reason.
           test, count = re.subn(
               r"(?m)^(\s*)prior_message_count,\n\s*first_request\.prompt\.tools\.len\(\),$",
               lambda match: f"{match.group(1)}0,\n{match.group(1)}first_request.prompt.tools.len(),",
@@ -57,7 +51,6 @@ jobs:
           )
           if count != 1:
               raise SystemExit(f"threshold anchor call regex count: {count}")
-
           test, count = re.subn(
               r"(?ms)^\s*let prior_message_count = store\n\s*\.load_current_messages\(&ConversationId::new\(\n\s*\"compaction-recovery-conversation\",\n\s*\)\)\n\s*\.await\n\s*\.unwrap\(\)\n\s*\.len\(\);\n",
               "",
@@ -66,7 +59,6 @@ jobs:
           )
           if count != 1:
               raise SystemExit(f"prior message count regex count: {count}")
-
           test = test.replace(
               "ContentPart, ConversationId, ModelConfigInput, ModelType, NewLlmCall,",
               "ContentPart, ModelConfigInput, ModelType, NewLlmCall,",
@@ -79,11 +71,32 @@ jobs:
           )
           test_path.write_text(test)
 
-          # Enforce the final threshold helper independently of the temporary
-          # patch scripts. This removes the old local estimator functions and
-          # guarantees RunEngine and CheckpointBuilder use the same estimator.
           engine_path = Path("server/src/run/engine.rs")
           engine = engine_path.read_text()
+
+          # Ensure one auto compaction does not disable later compactions after
+          # the conversation revision advances.
+          if "let mut last_auto_compaction_revision = None;" not in engine:
+              if engine.count("let mut auto_compacted = prepared.action == RunAction::Compact;") != 1:
+                  raise SystemExit("could not establish auto-compaction revision state")
+              engine = engine.replace(
+                  "let mut auto_compacted = prepared.action == RunAction::Compact;",
+                  "let mut last_auto_compaction_revision = None;",
+                  1,
+              )
+          if "last_auto_compaction_revision = Some(revision);" not in engine:
+              pattern = re.compile(
+                  r"(Ok\(\(next_revision, compaction_usage\)\) => \{\n\s*revision = next_revision;\n)"
+              )
+              engine, count = pattern.subn(
+                  r"\1                        last_auto_compaction_revision = Some(revision);\n",
+                  engine,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit(f"compaction success re-arm patch count: {count}")
+
+          # Enforce one shared token estimator and output-aware threshold.
           helper_start = engine.find("fn auto_compaction_allowed(")
           if helper_start == -1:
               helper_start = engine.index("fn should_auto_compact(")
@@ -142,7 +155,6 @@ jobs:
           engine = engine[:helper_start] + helpers + engine[helper_end:]
           engine_path.write_text(engine)
 
-          # Structural assertions before spending minutes compiling.
           engine = engine_path.read_text()
           model_mod = Path("server/src/model/mod.rs").read_text()
           token_estimator = Path("server/src/model/token_estimate.rs").read_text()
@@ -153,7 +165,8 @@ jobs:
               "shared engine message estimator": "crate::model::estimate_message_tokens" in engine,
               "shared engine context estimator": "crate::model::estimate_context_tokens" in engine,
               "inclusive threshold": "estimated_input >= input_limit" in engine,
-              "revision re-arm": "last_auto_compaction_revision = Some(revision)" in engine,
+              "revision state": "let mut last_auto_compaction_revision = None;" in engine,
+              "revision re-arm": "last_auto_compaction_revision = Some(revision);" in engine,
               "shared estimator module": "mod token_estimate;" in model_mod and "estimate_message_tokens" in token_estimator,
               "compacted token reset": "self.record_context_tokens(Some(estimate_context_tokens(" in summary,
               "checkpoint published before continuation": "self.checkpoint.publish(&self.handle, &checkpoint).await" in session,
