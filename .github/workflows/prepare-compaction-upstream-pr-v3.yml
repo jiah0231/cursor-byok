@@ -1,0 +1,88 @@
+name: Prepare upstream compaction PR v3
+
+on:
+  push:
+    branches:
+      - fix/compaction-during-resume-timeout
+    paths:
+      - .github/workflows/prepare-compaction-upstream-pr-v3.yml
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/compaction-during-resume-timeout
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Reuse verified upstream integration step
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --quiet pyyaml
+          python - <<'PY'
+          import yaml
+          from pathlib import Path
+          workflow = yaml.safe_load(Path('.github/workflows/prepare-compaction-upstream-pr-v2.yml').read_text())
+          step = next(
+              step for step in workflow['jobs']['prepare']['steps']
+              if step.get('name') == 'Build clean branch on current upstream main'
+          )
+          Path('/tmp/build-clean-branch.sh').write_text(step['run'])
+          PY
+          bash /tmp/build-clean-branch.sh
+
+          # Current upstream Resume has no generic literal <resume> marker. The timeout
+          # test should assert the durable fallback summary and continuation, not a
+          # fork-specific marker from a separate Resume-progress change.
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('server/tests/compaction_timeout.rs')
+          s = p.read_text()
+          stale = '    assert!(continued_history.contains("<resume>"));\n'
+          if s.count(stale) != 1:
+              raise SystemExit('timeout resume-marker assertion changed')
+          p.write_text(s.replace(stale, '', 1))
+          PY
+          git add server/tests/compaction_timeout.rs
+          git diff --cached --check
+
+      - name: Full validation on current upstream main
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo fmt --all
+          git add server/src/cursor/checkpoint/summary.rs \
+                  server/src/cursor/session.rs \
+                  server/src/model/configuration.rs \
+                  server/src/model/mod.rs \
+                  server/src/model/token_estimate.rs \
+                  server/src/run/engine.rs \
+                  server/tests/compaction_recovery.rs \
+                  server/tests/compaction_timeout.rs
+          cargo fmt --all -- --check
+          cargo test -p cursor-server --test compaction_recovery -- --nocapture
+          cargo test -p cursor-server --test compaction_timeout -- --nocapture
+          cargo test -p cursor-server --test compaction -- --nocapture
+          cargo test -p cursor-server run::engine::tests -- --nocapture
+          cargo test -p cursor-server --all-targets
+          git diff --cached --check
+
+      - name: Commit and push clean branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "jiah0231"
+          git config user.email "2243725197@cug.edu.cn"
+          git commit -m "fix: make automatic compaction durable and recoverable"
+          git push --force-with-lease origin HEAD:fix/compaction-recovery-upstream
