@@ -6,6 +6,7 @@ use std::{
 use tokio::sync::Mutex;
 
 pub mod codec;
+pub(crate) mod compat;
 mod dispatch;
 pub(crate) mod edit;
 pub(crate) mod result;
