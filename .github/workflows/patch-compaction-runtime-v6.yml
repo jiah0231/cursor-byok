@@ -1,0 +1,375 @@
+name: Verify resume compaction and timeout fallback
+on:
+  push:
+    branches: [fix/compaction-during-resume-timeout]
+    paths: [.github/workflows/patch-compaction-runtime-v6.yml]
+permissions:
+  contents: write
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/compaction-during-resume-timeout
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply product fix and regressions
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('server/src/run/engine.rs')
+          s = p.read_text()
+
+          assert 'use std::sync::Arc;' in s
+          s = s.replace('use std::sync::Arc;', 'use std::{sync::Arc, time::Duration};', 1)
+          assert 'const COMPACTION_OUTPUT_TOKENS: u64 = 4_096;' in s
+          s = s.replace('const COMPACTION_OUTPUT_TOKENS: u64 = 4_096;', 'const COMPACTION_OUTPUT_TOKENS: u64 = 2_048;', 1)
+          assert 'const COMPACTION_OUTPUT_SAFETY_TOKENS: u64 = 4_096;' in s
+          s = s.replace('const COMPACTION_OUTPUT_SAFETY_TOKENS: u64 = 4_096;', 'const COMPACTION_OUTPUT_SAFETY_TOKENS: u64 = 4_096;\nconst AUTO_COMPACTION_TIMEOUT: Duration = Duration::from_secs(30);', 1)
+
+          old = '*action == RunAction::Start && last_auto_compaction_revision != Some(revision)'
+          assert old in s
+          s = s.replace(old, '!matches!(action, RunAction::Compact) && last_auto_compaction_revision != Some(revision)', 1)
+          old = 'prepared.action != RunAction::Start || messages.len() <= prepared.initial_messages.len()'
+          assert old in s
+          s = s.replace(old, 'prepared.action == RunAction::Compact || messages.len() <= prepared.initial_messages.len()', 1)
+
+          old = '        let mut last_auto_compaction_revision = None;\n        \'model: loop {'
+          assert old in s
+          s = s.replace(old, '        let mut last_auto_compaction_revision = None;\n        let mut provider_completed_this_run = false;\n        \'model: loop {', 1)
+
+          old = '''            let context_anchor = if can_auto_compact {
+                  match self
+                      .store
+                      .latest_llm_call_usage_anchor(
+                          &prepared.conversation_id,
+                          &prepared.model.model_id,
+                      )
+                      .await
+                  {
+                      Ok(anchor) => anchor.and_then(ContextUsageAnchor::from_llm_call),
+                      Err(error) => return (RunOutcome::Failed(error.into()), usage),
+                  }
+              } else {
+                  None
+              };'''
+          new = '''            // A Resume may start from a freshly compacted checkpoint while the latest
+              // completed LLM usage still describes the pre-compaction history. Do not let that
+              // stale cross-run anchor immediately re-trigger compaction. Once this run completes
+              // a normal provider call, its usage is current and can safely anchor later tool loops.
+              let may_use_usage_anchor =
+                  prepared.action == RunAction::Start || provider_completed_this_run;
+              let context_anchor = if can_auto_compact && may_use_usage_anchor {
+                  match self
+                      .store
+                      .latest_llm_call_usage_anchor(
+                          &prepared.conversation_id,
+                          &prepared.model.model_id,
+                      )
+                      .await
+                  {
+                      Ok(anchor) => anchor.and_then(ContextUsageAnchor::from_llm_call),
+                      Err(error) => return (RunOutcome::Failed(error.into()), usage),
+                  }
+              } else {
+                  None
+              };'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''            if let Some(cycle_usage) = cycle.usage {
+                  accumulate_usage(&mut usage, cycle_usage);
+              }
+
+              if prepared.action == RunAction::Compact {'''
+          new = '''            provider_completed_this_run = true;
+              if let Some(cycle_usage) = cycle.usage {
+                  accumulate_usage(&mut usage, cycle_usage);
+              }
+
+              if prepared.action == RunAction::Compact {'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          # Add a total deadline to automatic compaction. Dropping the pinned cycle after
+          # cancelling it avoids waiting on a provider stream that ignores cancellation.
+          old = '''        let mut pending_insertions = Vec::new();
+              let mut interrupted_message = None;
+              let cycle = {
+                  let cycle = consume_model_cycle(
+                      self.provider.stream(invocation, cycle_cancellation.clone()),
+                      &silent_events,
+                      &cycle_cancellation,
+                  );
+                  tokio::pin!(cycle);
+                  loop {
+                      tokio::select! {
+                          biased;
+                          command = client.commands.recv() => match command {
+                              Some(ClientCommand::InsertMessages(insertion)) => {
+                                  pending_insertions.push(insertion);
+                              }
+                              Some(ClientCommand::InterruptWithMessage(message)) => {
+                                  cycle_cancellation.cancel();
+                                  interrupted_message = Some(message);
+                                  break cycle.await;
+                              }
+                              Some(ClientCommand::RuntimeEvent(event)) => {
+                                  cycle_cancellation.cancel();
+                                  interrupted_message = Some(event.into_message());
+                                  break cycle.await;
+                              }
+                              Some(ClientCommand::Cancel) => {
+                                  cycle_cancellation.cancel();
+                                  return Err(RunOutcome::Cancelled);
+                              }
+                              Some(ClientCommand::ClientClosed { error }) => {
+                                  cycle_cancellation.cancel();
+                                  return Err(RunOutcome::Failed(RunFailure::Client(error)));
+                              }
+                              Some(ClientCommand::ToolResult(_)) => {
+                                  cycle_cancellation.cancel();
+                                  return Err(RunOutcome::Failed(RunFailure::Protocol(
+                                      "received a tool result while automatic compaction was running".into(),
+                                  )));
+                              }
+                              None => {
+                                  cycle_cancellation.cancel();
+                                  return Err(client_failure());
+                              }
+                          },
+                          result = &mut cycle => break result,
+                      }
+                  }
+              };
+              drop(silent_events);
+              let _ = drain.await;
+              let (summary, compaction_usage) = match (interrupted_message.is_some(), cycle) {
+                  (true, Ok(cycle)) => (fallback_summary(&compactable), cycle.usage),
+                  (true, Err(failure)) => (fallback_summary(&compactable), failure.usage),
+                  (false, Ok(cycle)) if cycle.calls.is_empty() && !cycle.text.trim().is_empty() => {
+                      (cycle.text.trim().to_string(), cycle.usage)
+                  }
+                  (false, Ok(cycle)) => {
+                      tracing::warn!("automatic compaction returned no usable summary; using fallback");
+                      (fallback_summary(&compactable), cycle.usage)
+                  }
+                  (false, Err(failure)) => {
+                      tracing::warn!(error = ?failure.failure, "automatic compaction model failed; using fallback");
+                      (fallback_summary(&compactable), failure.usage)
+                  }
+              };'''
+          new = '''        let mut pending_insertions = Vec::new();
+              let mut interrupted_message = None;
+              let mut compaction_timed_out = false;
+              let cycle = {
+                  let cycle = consume_model_cycle(
+                      self.provider.stream(invocation, cycle_cancellation.clone()),
+                      &silent_events,
+                      &cycle_cancellation,
+                  );
+                  tokio::pin!(cycle);
+                  let timeout = tokio::time::sleep(AUTO_COMPACTION_TIMEOUT);
+                  tokio::pin!(timeout);
+                  loop {
+                      tokio::select! {
+                          biased;
+                          command = client.commands.recv() => match command {
+                              Some(ClientCommand::InsertMessages(insertion)) => {
+                                  pending_insertions.push(insertion);
+                              }
+                              Some(ClientCommand::InterruptWithMessage(message)) => {
+                                  cycle_cancellation.cancel();
+                                  interrupted_message = Some(message);
+                                  break Some(cycle.await);
+                              }
+                              Some(ClientCommand::RuntimeEvent(event)) => {
+                                  cycle_cancellation.cancel();
+                                  interrupted_message = Some(event.into_message());
+                                  break Some(cycle.await);
+                              }
+                              Some(ClientCommand::Cancel) => {
+                                  cycle_cancellation.cancel();
+                                  return Err(RunOutcome::Cancelled);
+                              }
+                              Some(ClientCommand::ClientClosed { error }) => {
+                                  cycle_cancellation.cancel();
+                                  return Err(RunOutcome::Failed(RunFailure::Client(error)));
+                              }
+                              Some(ClientCommand::ToolResult(_)) => {
+                                  cycle_cancellation.cancel();
+                                  return Err(RunOutcome::Failed(RunFailure::Protocol(
+                                      "received a tool result while automatic compaction was running".into(),
+                                  )));
+                              }
+                              None => {
+                                  cycle_cancellation.cancel();
+                                  return Err(client_failure());
+                              }
+                          },
+                          result = &mut cycle => break Some(result),
+                          _ = &mut timeout => {
+                              compaction_timed_out = true;
+                              cycle_cancellation.cancel();
+                              break None;
+                          },
+                      }
+                  }
+              };
+              drop(silent_events);
+              let _ = drain.await;
+              let (summary, compaction_usage) = match (interrupted_message.is_some(), compaction_timed_out, cycle) {
+                  (false, true, timed_out_cycle) => {
+                      tracing::warn!(
+                          timeout_seconds = AUTO_COMPACTION_TIMEOUT.as_secs(),
+                          "automatic compaction timed out; using fallback"
+                      );
+                      let timed_out_usage = match timed_out_cycle {
+                          Some(Ok(cycle)) => cycle.usage,
+                          Some(Err(failure)) => failure.usage,
+                          None => None,
+                      };
+                      (fallback_summary(&compactable), timed_out_usage)
+                  }
+                  (true, _, Some(Ok(cycle))) => (fallback_summary(&compactable), cycle.usage),
+                  (true, _, Some(Err(failure))) => (fallback_summary(&compactable), failure.usage),
+                  (false, false, Some(Ok(cycle))) if cycle.calls.is_empty() && !cycle.text.trim().is_empty() => {
+                      (cycle.text.trim().to_string(), cycle.usage)
+                  }
+                  (false, false, Some(Ok(cycle))) => {
+                      tracing::warn!("automatic compaction returned no usable summary; using fallback");
+                      (fallback_summary(&compactable), cycle.usage)
+                  }
+                  (false, false, Some(Err(failure))) => {
+                      tracing::warn!(error = ?failure.failure, "automatic compaction model failed; using fallback");
+                      (fallback_summary(&compactable), failure.usage)
+                  }
+                  (_, _, None) => (fallback_summary(&compactable), None),
+              };'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          # Resume is eligible; explicit Compact is never recursively compacted.
+          needle = '''        assert!(!auto_compaction_allowed(
+                  &RunAction::Compact,
+                  RevisionId(3),
+                  None,
+              ));'''
+          if needle in s:
+              s = s.replace(needle, '''        assert!(auto_compaction_allowed(
+                  &RunAction::Resume { pending_tool_round: None },
+                  RevisionId(3),
+                  Some(RevisionId(2)),
+              ));
+              assert!(!auto_compaction_allowed(
+                  &RunAction::Compact,
+                  RevisionId(3),
+                  None,
+              ));''', 1)
+          p.write_text(s)
+
+          # Add E2E: Resume itself must compact a genuinely large recovered state.
+          p = Path('server/tests/compaction_recovery.rs')
+          t = p.read_text()
+          marker = 'async fn record_threshold_anchor('
+          assert marker in t
+          tests = r'''#[tokio::test]
+          async fn resume_action_auto_compacts_large_recovered_state_without_new_user_message() {
+              let (_directory, store) = fixtures::temp_store().await;
+              let model = store.create_model(&ModelConfigInput {
+                  sort_order: 0, display_name: "Resume Threshold".into(), model_type: ModelType::OpenAi,
+                  base_url: "https://example.com/v1/chat/completions".into(), use_full_url: true,
+                  api_key: "test-key".into(), tooltip_data: "Resume Threshold".into(), model_id: "resume-threshold".into(),
+                  reasoning_effort: None, openai_endpoint: OPENAI_CHAT_ENDPOINT.into(), openai_extra_params_enabled: false,
+                  openai_extra_params: serde_json::json!({}), custom_headers_enabled: false, custom_headers: serde_json::json!({}),
+                  anthropic_extra_params_enabled: false, anthropic_extra_params: serde_json::json!({}),
+                  context_window_tokens: Some(30_000), max_completion_tokens: Some(4_000), anthropic_max_tokens: None,
+                  anthropic_thinking_effort: None, thinking_budget_tokens: None,
+              }).await.unwrap();
+              let provider = fake_provider::FakeProvider::default();
+              provider.push(text_response("x".repeat(100_000), 1_000, 25_000));
+              provider.push(text_response("resume summary marker", 26_000, 100));
+              provider.push(text_response("continued after resume compaction", 2_000, 20));
+              let assets = PromptAssets::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompt/cursor").as_path()).unwrap();
+              let registry = CursorSessionRegistry::new(store.clone(), Arc::new(provider.clone()), PromptCompiler::new(assets), Default::default());
+              let first = run(&registry, "resume-large-first", user_request("resume-large-conversation", "resume-user", "start long work", &model.model_hash, None)).await;
+              assert!(first.end_error.is_none());
+              let state = first.checkpoints.last().unwrap().clone();
+              let resumed = run(&registry, "resume-large-second", resume_request("resume-large-conversation", &model.model_hash, state)).await;
+              assert!(resumed.end_error.is_none());
+              assert_eq!(resumed.summary_started, 1);
+              assert_eq!(resumed.summary_completed, 1);
+              let requests = provider.requests();
+              assert_eq!(requests.len(), 3);
+              assert!(requests[1].prompt.tools.is_empty());
+              assert!(history_text(&requests[2].history).contains("resume summary marker"));
+          }
+
+          #[tokio::test]
+          async fn stalled_auto_compaction_falls_back_within_deadline_and_continues() {
+              let (_directory, store) = fixtures::temp_store().await;
+              let model = store.create_model(&ModelConfigInput {
+                  sort_order: 0, display_name: "Timeout Model".into(), model_type: ModelType::OpenAi,
+                  base_url: "https://example.com/v1/chat/completions".into(), use_full_url: true,
+                  api_key: "test-key".into(), tooltip_data: "Timeout Model".into(), model_id: "timeout-model".into(),
+                  reasoning_effort: None, openai_endpoint: OPENAI_CHAT_ENDPOINT.into(), openai_extra_params_enabled: false,
+                  openai_extra_params: serde_json::json!({}), custom_headers_enabled: false, custom_headers: serde_json::json!({}),
+                  anthropic_extra_params_enabled: false, anthropic_extra_params: serde_json::json!({}),
+                  context_window_tokens: Some(30_000), max_completion_tokens: Some(4_000), anthropic_max_tokens: None,
+                  anthropic_thinking_effort: None, thinking_budget_tokens: None,
+              }).await.unwrap();
+              let provider = fake_provider::FakeProvider::default();
+              provider.push(text_response("y".repeat(100_000), 1_000, 25_000));
+              provider.push_pending();
+              provider.push(text_response("continued after timeout fallback", 2_000, 20));
+              let assets = PromptAssets::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompt/cursor").as_path()).unwrap();
+              let registry = CursorSessionRegistry::new(store.clone(), Arc::new(provider.clone()), PromptCompiler::new(assets), Default::default());
+              let first = run(&registry, "timeout-first", user_request("timeout-conversation", "timeout-user", "start long work", &model.model_hash, None)).await;
+              assert!(first.end_error.is_none());
+              let state = first.checkpoints.last().unwrap().clone();
+              let started = std::time::Instant::now();
+              let resumed = run(&registry, "timeout-resume", resume_request("timeout-conversation", &model.model_hash, state)).await;
+              let elapsed = started.elapsed();
+              assert!(resumed.end_error.is_none());
+              assert_eq!(resumed.summary_started, 1);
+              assert_eq!(resumed.summary_completed, 1);
+              assert!(elapsed < Duration::from_secs(45), "stalled compaction must not hang indefinitely: {elapsed:?}");
+              let compacted = resumed.checkpoints.iter().rev().find(|state| state.summary.is_some()).unwrap();
+              let summary_id = compacted.summary.as_ref().unwrap();
+              let summary = pb::ConversationSummary::decode(resumed.blobs.get(summary_id).unwrap().as_slice()).unwrap();
+              assert!(summary.summary.contains("Durable recent conversation state"));
+              assert!(provider.requests().len() >= 3);
+          }
+
+          '''
+          t = t.replace(marker, tests + marker, 1)
+          # Give the deliberate 30s timeout test enough receiver headroom.
+          t = t.replace('tokio::time::timeout(Duration::from_secs(30), receiver.recv())', 'tokio::time::timeout(Duration::from_secs(60), receiver.recv())')
+          p.write_text(t)
+      - name: Format
+        run: cargo fmt --all
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Compaction recovery, Resume, timeout E2E
+        run: cargo test -p cursor-server --test compaction_recovery -- --nocapture --test-threads=1
+      - name: Engine compaction unit tests
+        run: cargo test -p cursor-server run::engine::tests -- --nocapture
+      - name: Existing compaction tests
+        run: cargo test -p cursor-server --test compaction -- --nocapture
+      - name: Resume regression
+        run: cargo test -p cursor-server --test resume_progress -- --nocapture
+      - name: Full server suite
+        run: cargo test -p cursor-server --all-targets
+      - name: Diff check
+        run: git diff --check
+      - name: Commit verified product changes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add server/src/run/engine.rs server/tests/compaction_recovery.rs
+          git commit -m "fix: compact throughout resumed work and bound summary latency"
+          git push origin HEAD:fix/compaction-during-resume-timeout
