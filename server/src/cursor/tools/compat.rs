@@ -121,7 +121,10 @@ mod tests {
         let completion = failure(&tool("AwaitShell"));
         assert!(completion.result().is_error);
         assert!(completion.result().content.contains("older version"));
-        assert!(completion.result().content.contains("current Shell/background completion flow"));
+        assert!(completion
+            .result()
+            .content
+            .contains("current Shell/background completion flow"));
         let Some(pb::tool_call::Tool::McpToolCall(rendered)) = completion.tool_call().tool.as_ref()
         else {
             panic!("expected compatibility MCP card");
