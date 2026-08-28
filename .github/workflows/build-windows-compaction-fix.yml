@@ -1,0 +1,70 @@
+name: Build Windows compaction recovery test package
+
+on:
+  push:
+    branches:
+      - build/windows-compaction-fix-20260828
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run compaction recovery E2E
+        run: cargo test -p cursor-server --test compaction_recovery -- --nocapture
+
+      - name: Run compaction engine regressions
+        run: cargo test -p cursor-server run::engine::tests -- --nocapture
+
+      - name: Build NSIS installer
+        working-directory: apps/desktop
+        shell: pwsh
+        run: npm run tauri -- build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Collect artifacts and checksums
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-windows | Out-Null
+          $installer = Get-ChildItem target/release/bundle/nsis/*.exe | Select-Object -First 1
+          if (-not $installer) { throw "NSIS installer not found" }
+          Copy-Item $installer.FullName dist-windows/cursor-byok-0.1.5-beta.1-compaction-fix-windows-x64-setup.exe
+          Copy-Item target/release/cursor-byok-desktop.exe dist-windows/cursor-byok-0.1.5-beta.1-compaction-fix-windows-x64-portable.exe
+          "source_commit=fbd1b3197ad32bc1a10800d6cae36b118981a511" | Set-Content dist-windows/BUILD_INFO.txt
+          "source_branch=fix/compaction-recovery-threshold" | Add-Content dist-windows/BUILD_INFO.txt
+          "desktop_version=0.1.5-beta.1" | Add-Content dist-windows/BUILD_INFO.txt
+          $hashes = Get-ChildItem dist-windows/*.exe | Get-FileHash -Algorithm SHA256
+          $hashes | ForEach-Object { "$($_.Hash.ToLower())  $([System.IO.Path]::GetFileName($_.Path))" } | Set-Content dist-windows/SHA256SUMS.txt
+          Get-ChildItem dist-windows | Format-Table Name,Length
+          Get-Content dist-windows/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cursor-byok-0.1.5-beta.1-compaction-fix-windows-x64
+          path: dist-windows/*
+          if-no-files-found: error
+          retention-days: 7
