@@ -21,7 +21,7 @@ use crate::{
     store::Store,
 };
 
-use super::{inbox::OrderedInbox, lifecycle, CursorCommand, CursorSessionHandle};
+use super::{inbox::OrderedInbox, CursorCommand, CursorSessionHandle};
 
 pub struct CursorActor;
 
