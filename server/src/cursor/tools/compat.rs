@@ -1,0 +1,150 @@
+use crate::{
+    cursor::proto::agent::v1 as pb,
+    model::{ToolCall, ToolResult},
+};
+
+use super::{codec, result::ToolCompletion, runtime::now_ms};
+
+const COMPAT_PROVIDER: &str = "cursor-byok-compat";
+
+pub(crate) fn placeholder(name: &str, call_id: &str) -> pb::ToolCall {
+    pb::ToolCall {
+        hook_additional_contexts: Vec::new(),
+        tool_call_id: Some(call_id.into()),
+        started_at_ms: None,
+        completed_at_ms: None,
+        tool: Some(pb::tool_call::Tool::McpToolCall(pb::McpToolCall {
+            args: Some(pb::McpArgs {
+                name: name.into(),
+                tool_call_id: call_id.into(),
+                provider_identifier: COMPAT_PROVIDER.into(),
+                tool_name: name.into(),
+                server_identifier: COMPAT_PROVIDER.into(),
+                ..Default::default()
+            }),
+            result: None,
+            description: Some("Unavailable legacy or unsupported tool".into()),
+        })),
+    }
+}
+
+pub(crate) fn render(call: &ToolCall, completed: bool) -> pb::ToolCall {
+    let mut output = placeholder(&call.name, &call.call_id);
+    let timestamp = now_ms();
+    output.started_at_ms = Some(timestamp);
+    output.completed_at_ms = completed.then_some(timestamp);
+    if let Some(pb::tool_call::Tool::McpToolCall(tool)) = output.tool.as_mut() {
+        if let Some(args) = tool.args.as_mut() {
+            args.args = call
+                .arguments
+                .as_object()
+                .map(codec::json_object_to_prost)
+                .unwrap_or_default();
+        }
+    }
+    output
+}
+
+pub(crate) fn failure(call: &ToolCall) -> ToolCompletion {
+    let error = failure_message(&call.name);
+    let arguments = call
+        .arguments
+        .as_object()
+        .map(codec::json_object_to_prost)
+        .unwrap_or_default();
+    ToolCompletion::new(
+        call,
+        now_ms(),
+        ToolResult {
+            call_id: call.call_id.clone(),
+            content: error.clone(),
+            is_error: true,
+            image: None,
+        },
+        pb::tool_call::Tool::McpToolCall(pb::McpToolCall {
+            args: Some(pb::McpArgs {
+                name: call.name.clone(),
+                args: arguments,
+                tool_call_id: call.call_id.clone(),
+                provider_identifier: COMPAT_PROVIDER.into(),
+                tool_name: call.name.clone(),
+                server_identifier: COMPAT_PROVIDER.into(),
+                ..Default::default()
+            }),
+            result: Some(pb::McpToolResult {
+                result: Some(pb::mcp_tool_result::Result::Error(pb::McpToolError {
+                    error,
+                    read_tool_def_reminder: String::new(),
+                })),
+            }),
+            description: Some("Unavailable legacy or unsupported tool".into()),
+        }),
+    )
+}
+
+fn failure_message(name: &str) -> String {
+    if normalized(name) == "awaitshell" {
+        return "Tool \"AwaitShell\" is no longer available in this Cursor BYOK version. This call may have been restored from a conversation created by an older version. Treat the tool call as failed and continue using only tools advertised in the current prompt; for background shell work, use the current Shell/background completion flow.".into();
+    }
+    format!(
+        "Tool \"{name}\" is not available in this Cursor BYOK version. It may come from an older conversation or from an unsupported model-generated tool call. Treat the tool call as failed and continue using a tool advertised in the current prompt."
+    )
+}
+
+fn normalized(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool(name: &str) -> ToolCall {
+        let arguments = serde_json::json!({"shell_id": "legacy-shell", "block_until_ms": 30000});
+        ToolCall {
+            index: 0,
+            call_id: "call-1".into(),
+            model_call_id: "model-call-1".into(),
+            name: name.into(),
+            arguments_text: arguments.to_string(),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn retired_await_shell_is_a_model_visible_failure() {
+        let completion = failure(&tool("AwaitShell"));
+        assert!(completion.result().is_error);
+        assert!(completion.result().content.contains("older version"));
+        assert!(completion.result().content.contains("current Shell/background completion flow"));
+        let Some(pb::tool_call::Tool::McpToolCall(rendered)) = completion.tool_call().tool.as_ref()
+        else {
+            panic!("expected compatibility MCP card");
+        };
+        let args = rendered.args.as_ref().unwrap();
+        assert_eq!(args.provider_identifier, COMPAT_PROVIDER);
+        assert_eq!(args.tool_name, "AwaitShell");
+    }
+
+    #[test]
+    fn arbitrary_unknown_tool_is_a_model_visible_failure() {
+        let completion = failure(&tool("OldTool"));
+        assert!(completion.result().is_error);
+        assert!(completion.result().content.contains("not available"));
+        assert_eq!(
+            completion
+                .tool_call()
+                .tool
+                .as_ref()
+                .and_then(|tool| match tool {
+                    pb::tool_call::Tool::McpToolCall(tool) => tool.args.as_ref(),
+                    _ => None,
+                })
+                .map(|args| args.tool_name.as_str()),
+            Some("OldTool")
+        );
+    }
+}
