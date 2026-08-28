@@ -5,6 +5,8 @@ use crate::{
 
 use super::{codec, result::ToolCompletion, runtime::now_ms};
 
+// Unknown/retired tools use a generic Cursor MCP card only as a wire/UI
+// representation; they are never dispatched to an MCP server.
 const COMPAT_PROVIDER: &str = "cursor-byok-compat";
 
 pub(crate) fn placeholder(name: &str, call_id: &str) -> pb::ToolCall {
