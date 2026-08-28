@@ -1,0 +1,34 @@
+name: Verify stalled compaction timeout fallback
+on:
+  push:
+    branches: [fix/compaction-during-resume-timeout]
+    paths: [.github/workflows/verify-compaction-timeout.yml]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/compaction-during-resume-timeout
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Permanent-pending compaction timeout E2E
+        run: cargo test -p cursor-server --test compaction_timeout -- --nocapture
+      - name: Compaction recovery and Resume E2E
+        run: cargo test -p cursor-server --test compaction_recovery -- --nocapture
+      - name: Engine compaction unit tests
+        run: cargo test -p cursor-server run::engine::tests -- --nocapture
+      - name: Existing compaction tests
+        run: cargo test -p cursor-server --test compaction -- --nocapture
+      - name: Resume regression
+        run: cargo test -p cursor-server --test resume_progress -- --nocapture
+      - name: Full server suite
+        run: cargo test -p cursor-server --all-targets
+      - name: Diff check
+        run: git diff --check
