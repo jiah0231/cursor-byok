@@ -1,0 +1,357 @@
+name: Finalize compaction recovery fix
+
+on:
+  push:
+    branches:
+      - fix/compaction-recovery-threshold
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Build final source patch
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          # Reuse v3 for the already-correct independent source edits:
+          # shared estimator module, config propagation, checkpoint token reset,
+          # immediate auto-compaction checkpoint publication and regression file.
+          workflow = Path(".github/workflows/apply-compaction-recovery-fix-v3.yml").read_text()
+          marker = "      - name: Complete source patch\n        shell: python\n        run: |\n"
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index("\n      - name: Format", start)
+          block = workflow[start:end]
+          script = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in block.splitlines()
+          )
+          exec(compile(script, "v3-compaction-patch", "exec"), {})
+
+          # Make the E2E usage anchor valid independent of Cursor root projection.
+          test_path = Path("server/tests/compaction_recovery.rs")
+          test = test_path.read_text()
+          test, count = re.subn(
+              r"(?m)^(\s*)prior_message_count,\n\s*first_request\.prompt\.tools\.len\(\),$",
+              lambda m: f"{m.group(1)}0,\n{m.group(1)}first_request.prompt.tools.len(),",
+              test,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f"usage-anchor argument patch count={count}")
+          test, count = re.subn(
+              r"(?ms)^\s*let prior_message_count = store\n\s*\.load_current_messages\(&ConversationId::new\(\n\s*\"compaction-recovery-conversation\",\n\s*\)\)\n\s*\.await\n\s*\.unwrap\(\)\n\s*\.len\(\);\n",
+              "",
+              test,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit(f"usage-anchor setup patch count={count}")
+          test = test.replace(
+              "ContentPart, ConversationId, ModelConfigInput, ModelType, NewLlmCall,",
+              "ContentPart, ModelConfigInput, ModelType, NewLlmCall,",
+              1,
+          )
+          test = test.replace(
+              "ProjectedContent, ProjectedMessage, ProviderType, Role, Usage,",
+              "ProjectedContent, ProjectedMessage, Role, Usage,",
+              1,
+          )
+          test_path.write_text(test)
+
+          engine_path = Path("server/src/run/engine.rs")
+          engine = engine_path.read_text()
+
+          # Replace fixed 10k reserve with output-aware reserve constants.
+          old_constants = (
+              "const COMPACTION_RESERVE_TOKENS: u64 = 10_000;\n"
+              "const COMPACTION_OUTPUT_TOKENS: u64 = 4_096;\n"
+          )
+          new_constants = (
+              "const COMPACTION_MIN_RESERVE_TOKENS: u64 = 10_000;\n"
+              "const COMPACTION_OUTPUT_TOKENS: u64 = 4_096;\n"
+              "const COMPACTION_OUTPUT_SAFETY_TOKENS: u64 = 4_096;\n"
+          )
+          if old_constants in engine:
+              engine = engine.replace(old_constants, new_constants, 1)
+          elif "COMPACTION_MIN_RESERVE_TOKENS" not in engine:
+              raise SystemExit("compaction constants not recognized")
+
+          # Replace one-shot boolean state with revision-based re-arming.
+          if "let mut last_auto_compaction_revision = None;" not in engine:
+              old_decl = "let mut auto_compacted = prepared.action == RunAction::Compact;"
+              if engine.count(old_decl) != 1:
+                  raise SystemExit(f"auto-compaction declaration count={engine.count(old_decl)}")
+              engine = engine.replace(old_decl, "let mut last_auto_compaction_revision = None;", 1)
+
+          # Replace the old gate completely. This is intentionally structural so
+          # no stale auto_compacted references can survive.
+          old_gate = re.compile(
+              r"            let context_anchor = if !auto_compacted && prepared\.action == RunAction::Start \{\n"
+              r".*?"
+              r"            if !auto_compacted && should_auto_compact\(prepared, &messages, context_anchor\) \{\n"
+              r"                auto_compacted = true;\n",
+              re.S,
+          )
+          new_gate = '''            let can_auto_compact = auto_compaction_allowed(
+              &prepared.action,
+              revision,
+              last_auto_compaction_revision,
+          );
+          let context_anchor = if can_auto_compact {
+              match self
+                  .store
+                  .latest_llm_call_usage_anchor(
+                      &prepared.conversation_id,
+                      &prepared.model.model_id,
+                  )
+                  .await
+              {
+                  Ok(anchor) => anchor.and_then(ContextUsageAnchor::from_llm_call),
+                  Err(error) => return (RunOutcome::Failed(error.into()), usage),
+              }
+          } else {
+              None
+          };
+          if can_auto_compact && should_auto_compact(prepared, &messages, context_anchor) {
+          '''.replace("          ", "", 1)
+          if "auto_compacted" in engine:
+              engine, count = old_gate.subn(new_gate, engine, count=1)
+              if count != 1:
+                  raise SystemExit(f"auto-compaction main gate patch count={count}")
+
+          # Record the exact compressed revision. A later tool/runtime revision
+          # can compact again, while the same revision cannot loop forever.
+          if "last_auto_compaction_revision = Some(revision);" not in engine:
+              success = re.compile(
+                  r"(                    Ok\(\(next_revision, compaction_usage\)\) => \{\n"
+                  r"                        revision = next_revision;\n)"
+              )
+              engine, count = success.subn(
+                  r"\1                        last_auto_compaction_revision = Some(revision);\n",
+                  engine,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit(f"compaction success re-arm patch count={count}")
+
+          # Replace threshold helpers as one block; both engine threshold and
+          # checkpoint reset use model::token_estimate after this change.
+          helper_start = engine.find("fn auto_compaction_allowed(")
+          if helper_start == -1:
+              helper_start = engine.index("fn should_auto_compact(")
+          helper_end = engine.index("fn fallback_summary(", helper_start)
+          helpers = '''fn auto_compaction_allowed(
+              action: &RunAction,
+              revision: crate::model::RevisionId,
+              last_auto_compaction_revision: Option<crate::model::RevisionId>,
+          ) -> bool {
+              *action == RunAction::Start && last_auto_compaction_revision != Some(revision)
+          }
+
+          fn compaction_input_limit(prepared: &PreparedRun) -> Option<u64> {
+              let context_window = prepared.model.context_window_tokens?;
+              let reserve = prepared
+                  .model
+                  .max_output_tokens
+                  .unwrap_or_default()
+                  .saturating_add(COMPACTION_OUTPUT_SAFETY_TOKENS)
+                  .max(COMPACTION_MIN_RESERVE_TOKENS);
+              Some(context_window.saturating_sub(reserve))
+          }
+
+          fn should_auto_compact(
+              prepared: &PreparedRun,
+              messages: &[CanonicalMessage],
+              anchor: Option<ContextUsageAnchor>,
+          ) -> bool {
+              if prepared.action != RunAction::Start
+                  || messages.len() <= prepared.initial_messages.len()
+              {
+                  return false;
+              }
+              let Some(input_limit) = compaction_input_limit(prepared) else {
+                  return false;
+              };
+              let estimated_input = anchor
+                  .filter(|anchor| {
+                      anchor.message_count <= messages.len()
+                          && anchor.tool_count == prepared.prompt.tools.len()
+                  })
+                  .map(|anchor| {
+                      anchor.input_tokens.saturating_add(
+                          crate::model::estimate_message_tokens(
+                              &messages[anchor.message_count..],
+                          ),
+                      )
+                  })
+                  .unwrap_or_else(|| {
+                      crate::model::estimate_context_tokens(&prepared.prompt, messages)
+                  });
+              estimated_input >= input_limit
+          }
+
+          '''.replace("          ", "", 1)
+          engine = engine[:helper_start] + helpers + engine[helper_end:]
+          engine_path.write_text(engine)
+
+          # Add/retain behavioral unit coverage for the threshold and re-arm.
+          engine = engine_path.read_text()
+          if "fn output_budget_moves_auto_compaction_threshold_earlier()" not in engine:
+              marker = "    #[test]\n    fn auto_compaction_preserves_only_the_latest_request_context() {\n"
+              if engine.count(marker) != 1:
+                  raise SystemExit("unit-test insertion marker missing")
+              tests = r'''    #[test]
+              fn output_budget_moves_auto_compaction_threshold_earlier() {
+                  let current = CanonicalMessage::text(
+                      "runtime:current",
+                      Role::User,
+                      Origin::Runtime,
+                      "current",
+                  );
+                  let mut prepared = PreparedRun {
+                      run_id: RunId::new("run"),
+                      cursor_request_id: None,
+                      conversation_id: ConversationId::new("conversation"),
+                      kind: RunKind::Root,
+                      model: ModelSpec {
+                          context_window_tokens: Some(150_000),
+                          max_output_tokens: Some(16_000),
+                          ..ModelSpec::new("model")
+                      },
+                      prompt: PromptSpec {
+                          instructions: "system".into(),
+                          tools: Vec::new(),
+                      },
+                      initial_messages: vec![current.clone()],
+                      action: RunAction::Start,
+                      base_revision_id: RevisionId(1),
+                  };
+                  assert_eq!(compaction_input_limit(&prepared), Some(129_904));
+                  prepared.model.max_output_tokens = None;
+                  assert_eq!(compaction_input_limit(&prepared), Some(140_000));
+              }
+
+              #[test]
+              fn exact_auto_compaction_threshold_is_inclusive() {
+                  let old = CanonicalMessage::text("old", Role::User, Origin::User, "old");
+                  let current = CanonicalMessage::text(
+                      "runtime:current",
+                      Role::User,
+                      Origin::Runtime,
+                      "current",
+                  );
+                  let messages = vec![old, current.clone()];
+                  let prepared = PreparedRun {
+                      run_id: RunId::new("run"),
+                      cursor_request_id: None,
+                      conversation_id: ConversationId::new("conversation"),
+                      kind: RunKind::Root,
+                      model: ModelSpec {
+                          context_window_tokens: Some(150_000),
+                          max_output_tokens: Some(16_000),
+                          ..ModelSpec::new("model")
+                      },
+                      prompt: PromptSpec { instructions: String::new(), tools: Vec::new() },
+                      initial_messages: vec![current],
+                      action: RunAction::Start,
+                      base_revision_id: RevisionId(1),
+                  };
+                  let delta = crate::model::estimate_message_tokens(&messages[1..]);
+                  let anchor = ContextUsageAnchor {
+                      input_tokens: 129_904_u64.saturating_sub(delta),
+                      message_count: 1,
+                      tool_count: 0,
+                  };
+                  assert!(should_auto_compact(&prepared, &messages, Some(anchor)));
+              }
+
+              #[test]
+              fn auto_compaction_rearms_only_after_revision_advances() {
+                  assert!(auto_compaction_allowed(&RunAction::Start, RevisionId(10), None));
+                  assert!(!auto_compaction_allowed(
+                      &RunAction::Start,
+                      RevisionId(10),
+                      Some(RevisionId(10))
+                  ));
+                  assert!(auto_compaction_allowed(
+                      &RunAction::Start,
+                      RevisionId(11),
+                      Some(RevisionId(10))
+                  ));
+                  assert!(!auto_compaction_allowed(&RunAction::Compact, RevisionId(11), None));
+              }
+
+              '''.replace("              ", "", 1)
+              engine = engine.replace(marker, tests + marker, 1)
+              engine_path.write_text(engine)
+
+          # Fail fast if any stale or partial implementation survived.
+          engine = engine_path.read_text()
+          model_mod = Path("server/src/model/mod.rs").read_text()
+          estimator = Path("server/src/model/token_estimate.rs").read_text()
+          summary = Path("server/src/cursor/checkpoint/summary.rs").read_text()
+          session = Path("server/src/cursor/session.rs").read_text()
+          configuration = Path("server/src/model/configuration.rs").read_text()
+          invariants = {
+              "no one-shot auto_compacted state": "auto_compacted" not in engine,
+              "dynamic gate": "if can_auto_compact && should_auto_compact" in engine,
+              "revision re-arm": "last_auto_compaction_revision = Some(revision);" in engine,
+              "output-aware constants": "COMPACTION_MIN_RESERVE_TOKENS" in engine and "COMPACTION_OUTPUT_SAFETY_TOKENS" in engine,
+              "inclusive threshold": "estimated_input >= input_limit" in engine,
+              "shared estimator engine": "crate::model::estimate_context_tokens" in engine and "crate::model::estimate_message_tokens" in engine,
+              "shared estimator module": "mod token_estimate;" in model_mod and "estimate_context_tokens" in estimator,
+              "compressed token reset": "self.record_context_tokens(Some(estimate_context_tokens(" in summary,
+              "auto checkpoint publish": "self.checkpoint.publish(&self.handle, &checkpoint).await" in session,
+              "output budget propagation": "model.max_output_tokens = self.max_output_tokens();" in configuration,
+          }
+          missing = [name for name, ok in invariants.items() if not ok]
+          if missing:
+              raise SystemExit("final source invariants missing: " + ", ".join(missing))
+
+      - name: Format
+        run: cargo fmt --all
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run compaction recovery E2E
+        run: cargo test -p cursor-server --test compaction_recovery -- --nocapture
+      - name: Run existing compaction E2E
+        run: cargo test -p cursor-server --test compaction -- --nocapture
+      - name: Run resume E2E
+        run: cargo test -p cursor-server --test resume_progress -- --nocapture
+      - name: Run removed-tool regression
+        run: cargo test -p cursor-server --test removed_tool_compat -- --nocapture
+      - name: Run engine unit tests
+        run: cargo test -p cursor-server run::engine::tests -- --nocapture
+      - name: Test all cursor-server targets
+        run: cargo test -p cursor-server --all-targets
+      - name: Check patch whitespace
+        run: git diff --check
+
+      - name: Commit only tested product changes
+        shell: bash
+        run: |
+          rm -f .github/workflows/apply-compaction-recovery-fix.yml
+          rm -f .github/workflows/apply-compaction-recovery-fix-v2.yml
+          rm -f .github/workflows/apply-compaction-recovery-fix-v3.yml
+          rm -f .github/workflows/apply-compaction-recovery-fix-v4.yml
+          rm -f .github/workflows/apply-compaction-recovery-fix-v5.yml
+          git add -A
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix: make compaction durable and threshold-aware"
+          git push
