@@ -61,6 +61,13 @@ impl Provider for OpenAiChatProvider {
         let recorder = self.recorder.clone();
         Box::pin(try_stream! {
             let ModelInvocation { call_id, request, .. } = invocation;
+            tracing::debug!(
+                model = %request.model.model_id,
+                call_id = %call_id,
+                history_len = request.history.len(),
+                tools_count = request.prompt.tools.len(),
+                "OpenAI Chat provider stream started"
+            );
             let messages = openai_chat_messages(&request.prompt.instructions, &request.history)?;
             let mut body = json!({
                 "model": request.model.model_id,
@@ -85,7 +92,16 @@ impl Provider for OpenAiChatProvider {
                 _ = cancellation.cancelled() => return,
                 response = request => response,
             };
-            let response = response?;
+            let response = match response {
+                Ok(r) => {
+                    tracing::debug!(status = r.status().as_u16(), "OpenAI Chat HTTP response received");
+                    r
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "OpenAI Chat HTTP request failed");
+                    Err(Error::from(e))?
+                }
+            };
             if let Some(recorder) = &recorder {
                 recorder.response_headers(response.status().as_u16()).await?;
             }
@@ -118,15 +134,34 @@ impl Provider for OpenAiChatProvider {
             let mut final_usage = None;
             let mut finish = None;
             let mut saw_done_marker = false;
+            let mut loop_iteration: u64 = 0;
             loop {
+                loop_iteration += 1;
                 let event = tokio::select! {
                     _ = cancellation.cancelled() => {
+                        tracing::debug!(
+                            iteration = loop_iteration,
+                            saw_done_marker,
+                            tool_count = tools.len(),
+                            "OpenAI Chat stream cancelled"
+                        );
                         return;
                     }
                     event = source.next() => event,
                 };
-                let Some(event) = event else { break };
-                let event = event.map_err(|error| Error::Provider(format!("OpenAI Chat SSE: {error}")))?;
+                let Some(event) = event else {
+                    tracing::debug!(
+                        iteration = loop_iteration,
+                        saw_done_marker,
+                        "OpenAI Chat SSE stream ended"
+                    );
+                    break;
+                };
+                let event = event.map_err(|error| {
+                    let err_msg = error.to_string();
+                    tracing::debug!(iteration = loop_iteration, error = %error, "OpenAI Chat SSE event failed");
+                    Error::Provider(format!("OpenAI Chat SSE: {err_msg}"))
+                })?;
                 if event.data == "[DONE]" { saw_done_marker = true; break; }
                 let value: Value = serde_json::from_str(&event.data)?;
                 if let Some(usage) = value.get("usage").filter(|value| !value.is_null()) {

@@ -90,23 +90,75 @@ impl Provider for ProviderRouter {
             let provider = build_observed(&config, recorder.clone(), client)?;
             let stream_cancellation = cancellation.clone();
             let mut stream = provider.stream(invocation, cancellation);
+            let stream_started = std::time::Instant::now();
+            tracing::debug!(
+                model = %selected,
+                provider_type = ?provider_type,
+                timeout_ms = config.request_timeout.as_millis() as u64,
+                "provider stream created"
+            );
+            let mut last_event_time = std::time::Instant::now();
+            let mut event_count: u64 = 0;
             while let Some(event) = stream.next().await {
+                let now = std::time::Instant::now();
+                let gap_ms = now.duration_since(last_event_time).as_millis() as u64;
+                let elapsed_ms = now.duration_since(stream_started).as_millis() as u64;
+                event_count += 1;
                 match event {
                     Ok(event) => {
+                        let event_name = match &event {
+                            super::ModelEvent::Start { .. } => "Start",
+                            super::ModelEvent::TextStart => "TextStart",
+                            super::ModelEvent::TextDelta(_) => "TextDelta",
+                            super::ModelEvent::TextEnd => "TextEnd",
+                            super::ModelEvent::ThinkingStart => "ThinkingStart",
+                            super::ModelEvent::ThinkingDelta(_) => "ThinkingDelta",
+                            super::ModelEvent::ThinkingEnd => "ThinkingEnd",
+                            super::ModelEvent::ToolCallStart { .. } => "ToolCallStart",
+                            super::ModelEvent::ToolCallArgumentsDelta { .. } => "ToolCallArgsDelta",
+                            super::ModelEvent::ToolCallEnd { .. } => "ToolCallEnd",
+                            super::ModelEvent::ProviderReplayState(_) => "ReplayState",
+                            super::ModelEvent::Usage(_) => "Usage",
+                            super::ModelEvent::Done(_) => "Done",
+                        };
+                        if gap_ms > 5000 {
+                            tracing::debug!(
+                                gap_ms,
+                                elapsed_ms,
+                                event = event_name,
+                                event_count,
+                                "slow gap detected between provider events"
+                            );
+                        }
                         recorder.event(&event).await?;
+                        last_event_time = now;
                         yield event;
                     }
                     Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            elapsed_ms,
+                            gap_ms,
+                            event_count,
+                            "provider stream error"
+                        );
                         recorder.failed(&error).await?;
                         Err(error)?;
                     }
                 }
             }
             if !recorder.is_finished() {
+                let elapsed_ms = stream_started.elapsed().as_millis() as u64;
                 if stream_cancellation.is_cancelled() {
+                    tracing::debug!(elapsed_ms, event_count, "provider stream ended after cancellation");
                     recorder.cancelled().await?;
                 } else {
                     let error = Error::Provider("provider stream ended without Done".into());
+                    tracing::warn!(
+                        elapsed_ms,
+                        event_count,
+                        "provider stream ended without Done"
+                    );
                     recorder.failed(&error).await?;
                     Err(error)?;
                 }

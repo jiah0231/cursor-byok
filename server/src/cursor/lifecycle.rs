@@ -32,17 +32,26 @@ pub fn fail(handle: &CursorSessionHandle, error: &Error) -> Result<()> {
         | Error::Encode(_)
         | Error::Io(_) => plain_error(ConnectCode::Internal, error),
     };
-    handle.emit_frame(encode_error_end_stream(&stream_error)?);
+    // Always close the output even if encoding fails, to prevent silent hangs.
+    match encode_error_end_stream(&stream_error) {
+        Ok(frame) => handle.emit_frame(frame),
+        Err(_) => handle.emit_frame(encode_end_stream()),
+    }
     handle.close_output();
     Ok(())
 }
 
 pub fn cancel(handle: &CursorSessionHandle) -> Result<()> {
-    handle.emit_frame(encode_error_end_stream(&ConnectStreamError {
+    handle.cancel();
+    // Always close the output even if encoding fails, to prevent silent hangs.
+    match encode_error_end_stream(&ConnectStreamError {
         code: ConnectCode::Canceled,
         message: "run was cancelled".into(),
         details: Vec::new(),
-    })?);
+    }) {
+        Ok(frame) => handle.emit_frame(frame),
+        Err(_) => handle.emit_frame(encode_end_stream()),
+    }
     handle.close_output();
     Ok(())
 }

@@ -84,7 +84,7 @@ impl RequestContextSynchronizer {
         let result = tokio::select! {
             result = receiver => result.map_err(|_| Error::Protocol("request context response channel closed".into()))?,
             _ = cancellation.cancelled() => Err(Error::Cancelled),
-            _ = tokio::time::sleep(Duration::from_secs(15)) => Err(Error::Protocol("request context timed out".into())),
+            _ = tokio::time::sleep(Duration::from_secs(60)) => Err(Error::Protocol("request context timed out".into())),
         };
         if result.is_err() {
             self.pending.lock().await.take();
