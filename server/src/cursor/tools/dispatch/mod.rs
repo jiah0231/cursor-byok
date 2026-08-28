@@ -15,6 +15,7 @@ use crate::{
 };
 
 use super::{
+    compat,
     result::{ToolCompletion, ToolResultSender},
     runtime::{CursorToolRuntime, ExecContext, PendingInteraction},
 };
@@ -61,7 +62,14 @@ pub(super) async fn start(
         | "generateimage" => interaction::start(runtime, call).await,
         "todowrite" | "updatecurrentstep" => local::start(call, message_index),
         "semblesearch" | "semblefindrelated" => semble::start(results, call, store.cloned()),
-        _ => Err(Error::Protocol(format!("unsupported tool: {}", call.name))),
+        _ => Ok(unavailable_tool(call)),
+    }
+}
+
+fn unavailable_tool(call: &ToolCall) -> ToolStart {
+    ToolStart {
+        messages: Vec::new(),
+        completion: Some(compat::failure(call)),
     }
 }
 
@@ -195,5 +203,29 @@ mod tests {
             error.to_string(),
             "protocol error: Shell block_until_ms is out of range"
         );
+    }
+
+    #[test]
+    fn retired_await_shell_does_not_become_a_protocol_error() {
+        let call = tool(
+            "AwaitShell",
+            serde_json::json!({"shell_id": "legacy-shell", "block_until_ms": 30_000}),
+        );
+        let started = unavailable_tool(&call);
+        let completion = started.completion.expect("compatibility completion");
+
+        assert!(started.messages.is_empty());
+        assert!(completion.result().is_error);
+        assert!(completion.result().content.contains("older version"));
+    }
+
+    #[test]
+    fn arbitrary_unknown_tool_does_not_become_a_protocol_error() {
+        let call = tool("OldTool", serde_json::json!({"value": 1}));
+        let started = unavailable_tool(&call);
+        let completion = started.completion.expect("compatibility completion");
+
+        assert!(completion.result().is_error);
+        assert!(completion.result().content.contains("not available"));
     }
 }
