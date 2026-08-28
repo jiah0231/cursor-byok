@@ -1,0 +1,21 @@
+name: Windows prefix baseline
+
+on:
+  push:
+    branches:
+      - test/windows-prefix-baseline
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Run existing Windows prefix stability test
+        run: cargo test -p cursor-server --test prefix_stability every_captured_mode_owns_and_renders_its_runtime_template -- --nocapture
