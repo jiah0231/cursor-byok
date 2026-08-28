@@ -1,0 +1,83 @@
+name: Prepare clean upstream compaction PR branch
+
+on:
+  push:
+    branches:
+      - fix/compaction-during-resume-timeout
+    paths:
+      - .github/workflows/prepare-compaction-upstream-pr.yml
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/compaction-during-resume-timeout
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build clean branch on latest upstream main
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git remote add upstream https://github.com/leookun/cursor-byok.git
+          git fetch upstream main
+          git fetch origin main fix/compaction-during-resume-timeout
+
+          git diff --binary origin/main..origin/fix/compaction-during-resume-timeout -- \
+            server/src/cursor/checkpoint/summary.rs \
+            server/src/cursor/session.rs \
+            server/src/model/configuration.rs \
+            server/src/model/mod.rs \
+            server/src/model/token_estimate.rs \
+            server/src/run/engine.rs \
+            server/tests/compaction_recovery.rs \
+            server/tests/compaction_timeout.rs \
+            > /tmp/compaction.patch
+
+          git checkout -B fix/compaction-recovery-upstream upstream/main
+          git apply --3way --index /tmp/compaction.patch
+
+          git status --short
+          git diff --cached --check
+          git diff --cached --stat
+
+      - name: Format and test rebased result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo fmt --all
+          git add server/src/cursor/checkpoint/summary.rs \
+                  server/src/cursor/session.rs \
+                  server/src/model/configuration.rs \
+                  server/src/model/mod.rs \
+                  server/src/model/token_estimate.rs \
+                  server/src/run/engine.rs \
+                  server/tests/compaction_recovery.rs \
+                  server/tests/compaction_timeout.rs
+          cargo fmt --all -- --check
+          cargo test -p cursor-server --test compaction_recovery -- --nocapture
+          cargo test -p cursor-server --test compaction_timeout -- --nocapture
+          cargo test -p cursor-server --test compaction -- --nocapture
+          cargo test -p cursor-server --test resume_progress -- --nocapture
+          cargo test -p cursor-server run::engine::tests -- --nocapture
+          cargo test -p cursor-server --all-targets
+          git diff --cached --check
+
+      - name: Commit and push clean branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "jiah0231"
+          git config user.email "2243725197@cug.edu.cn"
+          git commit -m "fix: make automatic compaction durable and recoverable"
+          git push --force-with-lease origin HEAD:fix/compaction-recovery-upstream
