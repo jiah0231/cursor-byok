@@ -29,6 +29,8 @@ impl Store {
         conversation_id: Option<&str>,
         route: &str,
         model_id: Option<&str>,
+        reasoning_effort: Option<&str>,
+        fast: Option<bool>,
     ) -> Result<bool> {
         if self.cursor_trace_exists(request_id).await? {
             return Ok(true);
@@ -39,13 +41,16 @@ impl Store {
         let _write = self.writes.lock().await;
         sqlx::query(
             "INSERT OR IGNORE INTO cursor_run_traces(
-                request_id, conversation_id, route, model_id, status, received_at_ms
-             ) VALUES (?, ?, ?, ?, 'running', ?)",
+                request_id, conversation_id, route, model_id, reasoning_effort, fast,
+                status, received_at_ms
+             ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
         )
         .bind(request_id)
         .bind(conversation_id)
         .bind(route)
         .bind(model_id)
+        .bind(reasoning_effort)
+        .bind(fast.map(|value| if value { 1_i64 } else { 0_i64 }))
         .bind(now_ms())
         .execute(&self.pool)
         .await?;
@@ -310,6 +315,10 @@ fn trace_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CursorRunTraceSummary>
         conversation_id: row.try_get("conversation_id")?,
         route: row.try_get("route")?,
         model_id: row.try_get("model_id")?,
+        reasoning_effort: row.try_get("reasoning_effort")?,
+        fast: row
+            .try_get::<Option<i64>, _>("fast")?
+            .map(|value| value != 0),
         status: row.try_get("status")?,
         request_bytes: row.try_get("request_bytes")?,
         response_bytes: row.try_get("response_bytes")?,
@@ -335,7 +344,7 @@ mod tests {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         store.set_detailed_logging(true).await.unwrap();
         store
-            .start_cursor_trace_if_detailed("trace", None, "cursor_official", None)
+            .start_cursor_trace_if_detailed("trace", None, "cursor_official", None, None, None)
             .await
             .unwrap();
         sqlx::query("CREATE TABLE trace_summary_updates(count INTEGER NOT NULL)")

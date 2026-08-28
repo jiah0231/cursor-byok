@@ -34,6 +34,45 @@ impl DecodedAppend {
             })
     }
 
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        let agent::agent_client_message::Message::RunRequest(request) =
+            self.message.message.as_ref()?
+        else {
+            return None;
+        };
+        request
+            .requested_model
+            .as_ref()?
+            .parameters
+            .iter()
+            .rev()
+            .find(|parameter| matches!(parameter.id.as_str(), "effort" | "reasoning"))
+            .and_then(|parameter| {
+                let effort = parameter.value.trim();
+                (!effort.is_empty() && effort != "none").then_some(effort)
+            })
+    }
+
+    pub fn fast(&self) -> Option<bool> {
+        let agent::agent_client_message::Message::RunRequest(request) =
+            self.message.message.as_ref()?
+        else {
+            return None;
+        };
+        request
+            .requested_model
+            .as_ref()?
+            .parameters
+            .iter()
+            .rev()
+            .find(|parameter| parameter.id == "fast")
+            .and_then(|parameter| match parameter.value.trim() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            })
+    }
+
     pub fn conversation_id(&self) -> Option<&str> {
         let agent::agent_client_message::Message::RunRequest(request) =
             self.message.message.as_ref()?
@@ -110,6 +149,8 @@ impl DecodedAppend {
             "message_type": "run_request",
             "conversation_id": request.conversation_id,
             "model_id": self.model_id(),
+            "reasoning_effort": self.reasoning_effort(),
+            "fast": self.fast(),
             "action_type": action_type,
             "conversation_history_messages": history_messages,
             "conversation_history_images": history_images,
@@ -260,6 +301,33 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(decoded.model_id(), Some("33ceed20"));
+    }
+
+    #[test]
+    fn captures_requested_model_options_for_observability() {
+        let decoded = decode(&encoded(agent::AgentRunRequest {
+            requested_model: Some(agent::RequestedModel {
+                model_id: "grok-4.6".into(),
+                parameters: vec![
+                    agent::requested_model::ModelParameterValue {
+                        id: "effort".into(),
+                        value: "high".into(),
+                    },
+                    agent::requested_model::ModelParameterValue {
+                        id: "fast".into(),
+                        value: "false".into(),
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .unwrap();
+
+        assert_eq!(decoded.reasoning_effort(), Some("high"));
+        assert_eq!(decoded.fast(), Some(false));
+        assert_eq!(decoded.trace_metadata()["reasoning_effort"], "high");
+        assert_eq!(decoded.trace_metadata()["fast"], false);
     }
 
     #[test]

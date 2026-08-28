@@ -6,6 +6,8 @@ pub struct CursorRunTraceSummary {
     pub conversation_id: Option<String>,
     pub route: String,
     pub model_id: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub fast: Option<bool>,
     pub status: String,
     pub request_bytes: i64,
     pub response_bytes: i64,

@@ -290,6 +290,8 @@ mod tests {
             Some("conversation"),
             "local_byok",
             Some("model"),
+            None,
+            None,
         )
         .await
         .unwrap();

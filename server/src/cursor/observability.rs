@@ -37,9 +37,18 @@ impl CursorTraceRecorder {
         conversation_id: Option<&str>,
         route: &str,
         model_id: Option<&str>,
+        reasoning_effort: Option<&str>,
+        fast: Option<bool>,
     ) -> Option<Self> {
         match store
-            .start_cursor_trace_if_detailed(request_id, conversation_id, route, model_id)
+            .start_cursor_trace_if_detailed(
+                request_id,
+                conversation_id,
+                route,
+                model_id,
+                reasoning_effort,
+                fast,
+            )
             .await
         {
             Ok(true) => Some(Self {

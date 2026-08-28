@@ -126,6 +126,8 @@ async fn bidi_append_handler(
     let decoded = bidi_append::decode(&request)?;
     let first_model = decoded.model_id().map(str::to_owned);
     let conversation_id = decoded.conversation_id().map(str::to_owned);
+    let reasoning_effort = decoded.reasoning_effort().map(str::to_owned);
+    let fast = decoded.fast();
     let trace_metadata = decoded.trace_metadata();
     let local = if let Some(model_id) = decoded.model_id() {
         if registry.store().model(model_id).await?.is_some() {
@@ -163,6 +165,8 @@ async fn bidi_append_handler(
                 "cursor_official"
             },
             first_model.as_deref(),
+            reasoning_effort.as_deref(),
+            fast,
         )
         .await
     } else {
@@ -331,6 +335,16 @@ mod tests {
                 agent::AgentRunRequest {
                     requested_model: Some(agent::RequestedModel {
                         model_id: "grok-4.6".into(),
+                        parameters: vec![
+                            agent::requested_model::ModelParameterValue {
+                                id: "effort".into(),
+                                value: "high".into(),
+                            },
+                            agent::requested_model::ModelParameterValue {
+                                id: "fast".into(),
+                                value: "true".into(),
+                            },
+                        ],
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -374,6 +388,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(trace.route, "cursor_official");
+        assert_eq!(trace.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(trace.fast, Some(true));
         let artifacts = store
             .cursor_trace_artifacts("official-request")
             .await

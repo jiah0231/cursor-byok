@@ -32,6 +32,8 @@ async fn cursor_traces_are_absent_when_detailed_logging_is_disabled() {
             Some("conversation"),
             "local_byok",
             Some("model"),
+            None,
+            None,
         )
         .await
         .unwrap());
@@ -52,6 +54,8 @@ async fn cursor_trace_links_detailed_artifacts_to_the_logical_run() {
             Some("conversation"),
             "cursor_official",
             Some("official-model"),
+            Some("high"),
+            Some(false),
         )
         .await
         .unwrap());
@@ -88,6 +92,8 @@ async fn cursor_trace_links_detailed_artifacts_to_the_logical_run() {
         .unwrap()
         .unwrap();
     assert_eq!(trace.route, "cursor_official");
+    assert_eq!(trace.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(trace.fast, Some(false));
     assert_eq!(trace.status, "completed");
     assert_eq!(trace.request_bytes, 7);
     assert_eq!(trace.response_bytes, 8);
@@ -112,6 +118,8 @@ async fn cursor_trace_artifact_and_blob_are_written_atomically() {
             Some("conversation"),
             "cursor_official",
             Some("model"),
+            None,
+            None,
         )
         .await
         .unwrap();
