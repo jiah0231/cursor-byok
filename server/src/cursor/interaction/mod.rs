@@ -14,8 +14,7 @@ pub use query::tool_query;
 pub(crate) use render::{create_plan_partial, edit_content_delta, edit_path_partial};
 pub use render::{dynamic_mcp_placeholder, render_dynamic_mcp, tool_completed};
 use render::{
-    render_tool_call as render_builtin_tool_call,
-    tool_placeholder as builtin_tool_placeholder,
+    render_tool_call as render_builtin_tool_call, tool_placeholder as builtin_tool_placeholder,
     tool_started as builtin_tool_started,
 };
 
@@ -30,7 +29,9 @@ pub fn tool_placeholder(name: &str, call_id: &str) -> Result<pb::ToolCall> {
 pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall> {
     match render_builtin_tool_call(call, completed) {
         Ok(tool) => Ok(tool),
-        Err(error) if is_unsupported_tool(&error, &call.name) => Ok(compat::render(call, completed)),
+        Err(error) if is_unsupported_tool(&error, &call.name) => {
+            Ok(compat::render(call, completed))
+        }
         Err(error) => Err(error),
     }
 }
