@@ -1,9 +1,3 @@
-
-
-![Connect cursor-byok to a wide range of model APIs](./images/en-brand-1.png)
-
-![cursor-byok dashboard](./images/en-home-1.png)
-
 <div align="center">
 
 # cursor-byok
@@ -22,6 +16,10 @@ cursor-byok is a local implementation of Cursor's backend.
 
 
 </div>
+
+![Connect cursor-byok to a wide range of model APIs](./images/en-brand-1.png)
+
+![cursor-byok dashboard](./images/en-home-1.png)
 
 ## About
 

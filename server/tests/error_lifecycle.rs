@@ -20,6 +20,38 @@ use cursor_server::{
 use prost::Message;
 
 #[tokio::test]
+async fn abort_command_cancels_the_run_and_closes_output() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let assets = PromptAssets::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("prompt/cursor")
+            .as_path(),
+    )
+    .unwrap();
+    let registry = CursorSessionRegistry::new(
+        store,
+        Arc::new(fake_provider::FakeProvider::default()),
+        PromptCompiler::new(assets),
+        Default::default(),
+    );
+    let handle = registry.get_or_create("abort-request").await.unwrap();
+    let mut output = handle.subscribe();
+
+    handle.command(CursorCommand::Abort).await.unwrap();
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(1), output.recv())
+        .await
+        .unwrap()
+        .expect("Abort must emit a terminal frame");
+    let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+    assert_eq!(flags, connect::END_STREAM_FLAG);
+    let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(payload["error"]["code"], "canceled");
+    assert!(handle.cancellation().is_cancelled());
+    assert_eq!(output.recv().await, None);
+}
+
+#[tokio::test]
 async fn provider_failure_keeps_the_initial_checkpoint_then_returns_structured_error() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();

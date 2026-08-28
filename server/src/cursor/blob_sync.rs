@@ -129,7 +129,7 @@ impl BlobSynchronizer {
         let result = tokio::select! {
             result = receiver => result.map_err(|_| Error::Protocol("KV SET response channel closed".into()))?,
             _ = cancellation.cancelled() => Err(Error::Cancelled),
-            _ = tokio::time::sleep(Duration::from_secs(15)) => Err(Error::Protocol(format!("KV SET timed out: {}", blob_id.to_base64()))),
+            _ = tokio::time::sleep(Duration::from_secs(60)) => Err(Error::Protocol(format!("KV SET timed out: {}", blob_id.to_base64()))),
         };
         if result.is_err() {
             self.inner.set_requests.lock().await.remove(&id);
@@ -182,7 +182,7 @@ impl BlobSynchronizer {
         let result = tokio::select! {
             result = receiver => result.map_err(|_| Error::Protocol("KV GET response channel closed".into()))?,
             _ = cancellation.cancelled() => Err(Error::Cancelled),
-            _ = tokio::time::sleep(Duration::from_secs(15)) => Err(Error::Protocol(format!("KV GET timed out: {}", blob_id.to_base64()))),
+            _ = tokio::time::sleep(Duration::from_secs(60)) => Err(Error::Protocol(format!("KV GET timed out: {}", blob_id.to_base64()))),
         };
         if result.is_err() {
             self.inner.get_requests.lock().await.remove(&id);
