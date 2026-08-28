@@ -1,0 +1,46 @@
+name: Verify compaction recovery on Windows
+
+on:
+  push:
+    branches:
+      - fix/compaction-recovery-threshold
+
+permissions:
+  contents: write
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run compaction recovery E2E
+        run: cargo test -p cursor-server --test compaction_recovery -- --nocapture
+      - name: Run existing compaction E2E
+        run: cargo test -p cursor-server --test compaction -- --nocapture
+      - name: Run resume E2E
+        run: cargo test -p cursor-server --test resume_progress -- --nocapture
+      - name: Run removed-tool regression
+        run: cargo test -p cursor-server --test removed_tool_compat -- --nocapture
+      - name: Run engine unit tests
+        run: cargo test -p cursor-server run::engine::tests -- --nocapture
+      - name: Test all cursor-server targets
+        run: cargo test -p cursor-server --all-targets
+      - name: Remove temporary workflow
+        shell: pwsh
+        run: |
+          Remove-Item .github/workflows/verify-compaction-windows.yml
+          git add -A
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "ci: remove temporary Windows compaction verification"
+          git push
