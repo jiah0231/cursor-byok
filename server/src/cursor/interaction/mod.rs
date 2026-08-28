@@ -4,18 +4,59 @@ mod render;
 use std::{collections::BTreeMap, time::Duration};
 
 use crate::{
-    cursor::proto::agent::v1 as pb,
+    cursor::{proto::agent::v1 as pb, tools::compat},
     model::{ToolCall, Usage},
     provider::ModelEvent,
-    Result,
+    Error, Result,
 };
 
 pub use query::tool_query;
 pub(crate) use render::{create_plan_partial, edit_content_delta, edit_path_partial};
-pub use render::{
-    dynamic_mcp_placeholder, render_dynamic_mcp, render_tool_call, tool_completed,
-    tool_placeholder, tool_started,
+pub use render::{dynamic_mcp_placeholder, render_dynamic_mcp, tool_completed};
+use render::{
+    render_tool_call as render_builtin_tool_call,
+    tool_placeholder as builtin_tool_placeholder,
+    tool_started as builtin_tool_started,
 };
+
+pub fn tool_placeholder(name: &str, call_id: &str) -> Result<pb::ToolCall> {
+    match builtin_tool_placeholder(name, call_id) {
+        Ok(tool) => Ok(tool),
+        Err(error) if is_unsupported_tool(&error, name) => Ok(compat::placeholder(name, call_id)),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn render_tool_call(call: &ToolCall, completed: bool) -> Result<pb::ToolCall> {
+    match render_builtin_tool_call(call, completed) {
+        Ok(tool) => Ok(tool),
+        Err(error) if is_unsupported_tool(&error, &call.name) => Ok(compat::render(call, completed)),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn tool_started(
+    call: &ToolCall,
+    dynamic_mcp: Option<&pb::McpToolDefinition>,
+) -> Result<pb::AgentServerMessage> {
+    match builtin_tool_started(call, dynamic_mcp) {
+        Ok(message) => Ok(message),
+        Err(error) if dynamic_mcp.is_none() && is_unsupported_tool(&error, &call.name) => {
+            Ok(server_interaction(
+                pb::interaction_update::Message::ToolCallStarted(pb::ToolCallStartedUpdate {
+                    call_id: call.call_id.clone(),
+                    tool_call: Some(compat::render(call, false)),
+                    model_call_id: call.model_call_id.clone(),
+                }),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_unsupported_tool(error: &Error, name: &str) -> bool {
+    matches!(error, Error::Protocol(message) if message == &format!("unsupported tool: {name}"))
+}
 
 pub fn response_event(
     event: &ModelEvent,
@@ -202,5 +243,45 @@ pub fn server_interaction(message: pb::interaction_update::Message) -> pb::Agent
                 message: Some(message),
             },
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unknown_tool(name: &str) -> ToolCall {
+        let arguments = serde_json::json!({"shell_id": "legacy-shell", "value": 1});
+        ToolCall {
+            index: 0,
+            call_id: "call-1".into(),
+            model_call_id: "model-call-1".into(),
+            name: name.into(),
+            arguments_text: arguments.to_string(),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn retired_tool_streaming_uses_a_compatibility_card() {
+        let call = unknown_tool("AwaitShell");
+
+        assert!(tool_placeholder(&call.name, &call.call_id).is_ok());
+        assert!(render_tool_call(&call, false).is_ok());
+        assert!(tool_started(&call, None).is_ok());
+        assert!(arguments_delta(&call, "{\"shell_id\":").is_ok());
+    }
+
+    #[test]
+    fn arbitrary_unknown_tool_start_does_not_fail_the_agent_stream() {
+        let event = ModelEvent::ToolCallStart {
+            index: 0,
+            call_id: "call-1".into(),
+            name: "OldTool".into(),
+        };
+
+        assert!(response_event(&event, "model-call-1", &BTreeMap::new())
+            .unwrap()
+            .is_some());
     }
 }
