@@ -1,0 +1,111 @@
+name: Verify compaction recovery and threshold behavior
+
+on:
+  push:
+    branches:
+      - fix/compaction-recovery-threshold
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Apply source patch and corrected regression
+        shell: python
+        run: |
+          from pathlib import Path
+
+          # Execute the now-working v3 source patch in this workspace.
+          workflow = Path(".github/workflows/apply-compaction-recovery-fix-v3.yml").read_text()
+          marker = "      - name: Complete source patch\n        shell: python\n        run: |\n"
+          start = workflow.index(marker) + len(marker)
+          end = workflow.index("\n      - name: Format", start)
+          block = workflow[start:end]
+          script = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in block.splitlines()
+          )
+          exec(compile(script, "v3-compaction-patch", "exec"), {})
+
+          test_path = Path("server/tests/compaction_recovery.rs")
+          test = test_path.read_text()
+
+          # The previous E2E fixture anchored message_count to the persisted
+          # canonical count. A Cursor checkpoint can project a different root
+          # count, causing that synthetic anchor to be conservatively rejected.
+          # Use zero prior messages so the anchor is always valid, while the
+          # 132k authoritative provider input remains between the new dynamic
+          # limit (129,904) and the old fixed 140k limit.
+          old = """            prior_message_count,\n            first_request.prompt.tools.len(),\n"""
+          new = """            0,\n            first_request.prompt.tools.len(),\n"""
+          if test.count(old) != 1:
+              raise SystemExit(f"threshold anchor call match count: {test.count(old)}")
+          test = test.replace(old, new, 1)
+
+          # Remove the no-longer-needed persisted count and unused import.
+          count_block = """    let prior_message_count = store\n        .load_current_messages(&ConversationId::new(\n            \"compaction-recovery-conversation\",\n        ))\n        .await\n        .unwrap()\n        .len();\n"""
+          if test.count(count_block) != 1:
+              raise SystemExit(f"prior message count block match count: {test.count(count_block)}")
+          test = test.replace(count_block, "", 1)
+          test = test.replace("ContentPart, ConversationId, ModelConfigInput, ModelType, NewLlmCall,", "ContentPart, ModelConfigInput, ModelType, NewLlmCall,", 1)
+          test = test.replace("ProjectedContent, ProjectedMessage, ProviderType, Role, Usage,", "ProjectedContent, ProjectedMessage, Role, Usage,", 1)
+          test_path.write_text(test)
+
+          engine = Path("server/src/run/engine.rs").read_text()
+          if "crate::model::estimate_message_tokens" not in engine:
+              raise SystemExit("RunEngine is not using the shared message token estimator")
+          if "estimated_input >= input_limit" not in engine:
+              raise SystemExit("RunEngine threshold is not inclusive")
+          if "last_auto_compaction_revision = Some(revision)" not in engine:
+              raise SystemExit("RunEngine does not re-arm auto compaction by revision")
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run compaction recovery regression
+        run: cargo test -p cursor-server --test compaction_recovery -- --nocapture
+
+      - name: Run existing compaction tests
+        run: cargo test -p cursor-server --test compaction -- --nocapture
+
+      - name: Run resume regression
+        run: cargo test -p cursor-server --test resume_progress -- --nocapture
+
+      - name: Run removed-tool regression
+        run: cargo test -p cursor-server --test removed_tool_compat -- --nocapture
+
+      - name: Test cursor-server
+        run: cargo test -p cursor-server --all-targets
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+      - name: Commit tested fix and remove temporary workflows
+        shell: bash
+        run: |
+          rm .github/workflows/apply-compaction-recovery-fix.yml
+          rm .github/workflows/apply-compaction-recovery-fix-v2.yml
+          rm .github/workflows/apply-compaction-recovery-fix-v3.yml
+          rm .github/workflows/apply-compaction-recovery-fix-v4.yml
+          git add -A
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix: make compaction durable and threshold-aware"
+          git push
