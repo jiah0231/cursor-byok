@@ -1,0 +1,136 @@
+name: Fix and validate plugin effort visibility
+
+on:
+  push:
+    branches:
+      - fix/plugin-effort-visibility
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/plugin-effort-visibility
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Apply effort visibility fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('server/src/cursor/services/model_catalog.rs')
+          text = path.read_text()
+
+          old = '''    let contexts = context_options(model.context_window_tokens);
+              let variants = model_variants(
+                  &model.id,
+                  &model.display_name,
+                  &tooltip,
+                  &contexts,
+                  model.thinking,
+              );'''
+          new = '''    // Plugin providers validate the selected effort against their own model catalog.
+              // Keep the Cursor Effort axis visible even when a cached plugin descriptor was
+              // produced before reasoning capability metadata was refreshed.
+              let contexts = context_options(None);
+              let variants = model_variants(&model.id, &model.display_name, &tooltip, &contexts, true);'''
+          if old not in text:
+              raise SystemExit('available_plugin_model block not found')
+          text = text.replace(old, new, 1)
+          text = text.replace('supports_thinking: Some(model.thinking),', 'supports_thinking: Some(true),', 1)
+          text = text.replace('parameter_definitions: model_parameters(&contexts, model.thinking),', 'parameter_definitions: model_parameters(&contexts, true),', 1)
+          text = text.replace('thinking_details: model.thinking.then(agent::ThinkingDetails::default),', 'thinking_details: Some(agent::ThinkingDetails::default()),', 1)
+
+          test = r'''
+
+          #[cfg(test)]
+          mod plugin_effort_tests {
+              use super::*;
+
+              fn stale_plugin_model() -> PluginModelDescriptor {
+                  PluginModelDescriptor {
+                      id: "plugin:codex/codex/gpt-test".into(),
+                      plugin_id: "codex-auth".into(),
+                      plugin_name: "Codex".into(),
+                      provider_id: "codex".into(),
+                      model_id: "gpt-test".into(),
+                      display_name: "GPT Test".into(),
+                      description: None,
+                      icon: String::new(),
+                      provider_type: "openai".into(),
+                      context_window_tokens: None,
+                      max_output_tokens: None,
+                      thinking: false,
+                      images: true,
+                  }
+              }
+
+              #[test]
+              fn plugin_models_expose_effort_even_with_stale_thinking_metadata() {
+                  let model = stale_plugin_model();
+                  let available = available_plugin_model(&model);
+                  assert_eq!(available.supports_thinking, Some(true));
+                  assert!(available
+                      .parameter_definitions
+                      .iter()
+                      .any(|parameter| parameter.id == "reasoning"));
+                  assert!(available.variants.iter().any(|variant| {
+                      variant
+                          .parameter_values
+                          .iter()
+                          .any(|parameter| parameter.id == "reasoning")
+                  }));
+                  assert!(usable_plugin_model(&model).thinking_details.is_some());
+              }
+          }
+          '''
+          if 'mod plugin_effort_tests' not in text:
+              text = text.rstrip() + test + '\n'
+          path.write_text(text)
+
+          manifest = Path('server/plugins/build-in/codex-auth/plugin.json')
+          content = manifest.read_text()
+          if '"version": "0.1.0"' not in content:
+              raise SystemExit('expected codex-auth 0.1.0 manifest')
+          manifest.write_text(content.replace('"version": "0.1.0"', '"version": "0.1.1"', 1))
+          PY
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test host Effort projection
+        run: cargo test -p cursor-server plugin_effort_tests -- --nocapture
+
+      - name: Test Codex reasoning discovery
+        working-directory: server/plugins/build-in/codex-auth
+        run: deno test --allow-read models_reasoning_test.ts
+
+      - name: Test bundled plugin version refresh
+        run: cargo test -p cursor-server plugin::builtin::tests::install_is_version_gated_and_syncs_on_version_change -- --nocapture
+
+      - name: Run cursor-server regressions
+        run: cargo test -p cursor-server --all-targets -- --skip local_markdown_rules_land_in_the_request_context_message
+
+      - name: Verify diff
+        run: git diff --check
+
+      - name: Commit implementation
+        run: |
+          git config user.name "jiah0231"
+          git config user.email "2243725197@cug.edu.cn"
+          git add server/src/cursor/services/model_catalog.rs server/plugins/build-in/codex-auth/plugin.json
+          git commit -m "fix: expose plugin effort controls and refresh Codex bundle [skip ci]"
+          git push origin HEAD:fix/plugin-effort-visibility
