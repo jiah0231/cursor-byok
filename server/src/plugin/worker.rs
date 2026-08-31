@@ -24,6 +24,9 @@ use crate::{store::Store, Error, Result};
 const INVOCATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_NETWORK_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
+const NETWORK_CONNECT_RETRIES: usize = 2;
+const NETWORK_RETRY_BACKOFF: [Duration; NETWORK_CONNECT_RETRIES] =
+    [Duration::from_millis(150), Duration::from_millis(500)];
 
 /// 一次流式调用的输出:零或多个事件,然后恰好一个最终结果。
 #[derive(Debug)]
@@ -61,6 +64,7 @@ struct HostContext {
     plugin_id: String,
     network_hosts: Arc<HashSet<String>>,
     store: Store,
+    http_client: Arc<Mutex<Option<(String, reqwest::Client)>>>,
     cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     streams: Arc<Mutex<HashMap<String, StreamLines>>>,
 }
@@ -87,6 +91,7 @@ impl PluginWorker {
                             .collect(),
                     ),
                     store,
+                    http_client: Arc::new(Mutex::new(None)),
                     cancellations: Arc::new(Mutex::new(HashMap::new())),
                     streams: Arc::new(Mutex::new(HashMap::new())),
                 },
@@ -342,7 +347,7 @@ fn spawn_stdout_reader(
                                 .await;
                             }
                             Err(error) => {
-                                let text = error.to_string();
+                                let text = host_error_text(&error);
                                 let _ = write_message(
                                     &stdin,
                                     &HostMessage::HostError {
@@ -417,6 +422,66 @@ impl HostContext {
         }
     }
 
+    async fn http_client(&self) -> Result<reqwest::Client> {
+        // Reusing a reqwest Client preserves its connection pool and avoids a fresh
+        // DNS + TCP + TLS setup for every plugin request. Rebuild only when the
+        // persisted proxy configuration actually changes.
+        let settings = self.store.proxy_settings_secret().await?;
+        let fingerprint = serde_json::to_string(&settings)?;
+        let mut cached = self.http_client.lock().await;
+        if let Some((cached_fingerprint, client)) = cached.as_ref() {
+            if cached_fingerprint == &fingerprint {
+                return Ok(client.clone());
+            }
+        }
+        let client = crate::network::client_builder(&self.store)
+            .await?
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_max_idle_per_host(8)
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()?;
+        *cached = Some((fingerprint, client.clone()));
+        Ok(client)
+    }
+
+    async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        cancellation: &CancellationToken,
+    ) -> Result<reqwest::Response> {
+        let mut request = request;
+        for attempt in 0..=NETWORK_CONNECT_RETRIES {
+            let retry = request.try_clone();
+            let result = tokio::select! {
+                _ = cancellation.cancelled() => return Err(Error::Cancelled),
+                response = request.send() => response,
+            };
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) if retryable_connect_error(&error, attempt, retry.is_some()) => {
+                    let delay = NETWORK_RETRY_BACKOFF[attempt];
+                    tracing::warn!(
+                        plugin = %self.plugin_id,
+                        attempt = attempt + 1,
+                        max_attempts = NETWORK_CONNECT_RETRIES + 1,
+                        delay_ms = delay.as_millis(),
+                        error = %http_error_text(&error),
+                        "plugin network connect failed; retrying before request was sent"
+                    );
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return Err(Error::Cancelled),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    request = retry.expect("retryable request must be cloneable");
+                }
+                Err(error) => return Err(Error::Http(error)),
+            }
+        }
+        unreachable!("connect retry loop always returns")
+    }
+
     async fn request(
         &self,
         request_id: &str,
@@ -446,11 +511,7 @@ impl HostContext {
             .unwrap_or("GET")
             .parse::<reqwest::Method>()
             .map_err(|error| Error::Config(format!("invalid plugin HTTP method: {error}")))?;
-        let client = crate::network::client_builder(&self.store)
-            .await?
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(30))
-            .build()?;
+        let client = self.http_client().await?;
         let mut request = client.request(method, url);
         if let Some(headers) = params.get("headers").and_then(serde_json::Value::as_object) {
             for (name, value) in headers {
@@ -480,10 +541,7 @@ impl HostContext {
     ) -> Result<serde_json::Value> {
         let (request, cancellation) = self.request(request_id, &params).await?;
         let request = request.timeout(Duration::from_secs(60));
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            response = request.send() => response?,
-        };
+        let response = self.send_request(request, &cancellation).await?;
         let status = response.status().as_u16();
         if response
             .content_length()
@@ -515,10 +573,7 @@ impl HostContext {
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let (request, cancellation) = self.request(request_id, &params).await?;
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            response = request.send() => response?,
-        };
+        let response = self.send_request(request, &cancellation).await?;
         let status = response.status().as_u16();
         let headers = header_map(&response);
         let (sender, receiver) = mpsc::channel::<Result<String>>(256);
@@ -626,6 +681,46 @@ impl HostContext {
     }
 }
 
+fn retryable_connect_error(
+    error: &reqwest::Error,
+    attempt: usize,
+    request_cloneable: bool,
+) -> bool {
+    // `is_connect` is deliberately narrow: the connection was never established,
+    // so replaying the request cannot duplicate a provider-side generation.
+    error.is_connect() && attempt < NETWORK_CONNECT_RETRIES && request_cloneable
+}
+
+fn host_error_text(error: &Error) -> String {
+    match error {
+        Error::Http(error) => http_error_text(error),
+        _ => error.to_string(),
+    }
+}
+
+fn http_error_text(error: &reqwest::Error) -> String {
+    let kind = match (error.is_connect(), error.is_timeout()) {
+        (true, true) => "connect timeout",
+        (true, false) => "connect",
+        (false, true) => "timeout",
+        _ => "transport",
+    };
+    let mut causes = Vec::new();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !cause_text.is_empty() && causes.last() != Some(&cause_text) {
+            causes.push(cause_text);
+        }
+        source = cause.source();
+    }
+    if causes.is_empty() {
+        format!("http {kind} error: {error}")
+    } else {
+        format!("http {kind} error: {error}; cause: {}", causes.join(" -> "))
+    }
+}
+
 fn header_map(response: &reqwest::Response) -> std::collections::BTreeMap<String, String> {
     response
         .headers()
@@ -644,4 +739,33 @@ fn required_string<'a>(params: &'a serde_json::Value, key: &str) -> Result<&'a s
         .get(key)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| Error::Protocol(format!("plugin host call requires string '{key}'")))
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_errors_are_retryable_only_before_the_request_can_be_sent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(1))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_connect());
+        assert!(retryable_connect_error(&error, 0, true));
+        assert!(retryable_connect_error(&error, 1, true));
+        assert!(!retryable_connect_error(&error, 2, true));
+        assert!(!retryable_connect_error(&error, 0, false));
+        let detailed = http_error_text(&error);
+        assert!(detailed.contains("http connect"));
+        assert!(detailed.contains("cause:"));
+    }
 }
