@@ -16,10 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Package source
-        run: tar --exclude=.git -czf cursor-byok-source.tar.gz .
+        run: tar --exclude=.git -czf /tmp/cursor-byok-source.tar.gz .
       - uses: actions/upload-artifact@v4
         with:
           name: cursor-byok-source
-          path: cursor-byok-source.tar.gz
+          path: /tmp/cursor-byok-source.tar.gz
           if-no-files-found: error
           retention-days: 1
