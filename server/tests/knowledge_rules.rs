@@ -125,7 +125,10 @@ async fn offline_crud_round_trip_persists_markdown() {
     .unwrap();
     let added: AddResponse = decode(response).await;
     assert!(added.success);
-    assert!(added.id.starts_with("local-"), "offline add uses a local id");
+    assert!(
+        added.id.starts_with("local-"),
+        "offline add uses a local id"
+    );
     let markdown = rules_root.join(format!("{}.md", added.id));
     assert_eq!(
         std::fs::read_to_string(&markdown).unwrap(),
