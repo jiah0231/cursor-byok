@@ -1,0 +1,26 @@
+name: Upstream local rules baseline
+
+on:
+  push:
+    branches:
+      - test/upstream-9120-local-rules
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Run upstream local rules test three times
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            echo "=== baseline run $i ==="
+            cargo test -p cursor-server --test local_rules_context -- --nocapture
+          done
