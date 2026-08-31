@@ -1,0 +1,25 @@
+name: Export source snapshot
+
+on:
+  push:
+    branches:
+      - fix/auto-review-support-upstream
+    paths:
+      - ".github/workflows/source-export.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package source
+        run: tar --exclude=.git -czf /tmp/cursor-byok-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cursor-byok-upstream-source
+          path: /tmp/cursor-byok-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
