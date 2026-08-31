@@ -24,7 +24,11 @@ function positiveInteger(value: unknown): number | null {
 }
 
 function parseReasoningEfforts(model: Record<string, unknown>): string[] {
-  const source = model.supported_reasoning_efforts ??
+  // The current Codex /models contract calls this supported_reasoning_levels.
+  // Keep the older effort aliases for compatibility with earlier payloads.
+  const source = model.supported_reasoning_levels ??
+    model.supportedReasoningLevels ??
+    model.supported_reasoning_efforts ??
     model.supportedReasoningEfforts ??
     model.reasoning_efforts ??
     model.reasoningEfforts;
