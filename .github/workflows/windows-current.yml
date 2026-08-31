@@ -1,0 +1,113 @@
+name: Build current Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/windows-current.yml"
+      - "apps/desktop/**"
+      - "server/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-current-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64 current build
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Test Codex plugin
+        shell: pwsh
+        run: >-
+          deno test
+          --config server/plugins/build-in/codex-auth/deno.json
+          server/plugins/build-in/codex-auth
+
+      - name: Test plugin Effort catalog projection
+        run: cargo test -p cursor-server --lib plugin_models_expose_effort_even_with_stale_thinking_metadata
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Check frontend
+        working-directory: apps/desktop
+        run: npm run check
+
+      - name: Disable signed updater artifacts for current build
+        shell: pwsh
+        run: |
+          node -e "const fs=require('fs');const p='apps/desktop/src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p,'utf8'));c.bundle.createUpdaterArtifacts=false;fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n')"
+
+      - name: Build NSIS installer and portable executable
+        working-directory: apps/desktop
+        run: npm run tauri -- build --bundles nsis
+
+      - name: Package current build
+        id: package
+        shell: pwsh
+        run: |
+          $version = node -p "require('./apps/desktop/package.json').version"
+          $out = Join-Path $PWD "dist-windows"
+          New-Item -ItemType Directory -Force $out | Out-Null
+
+          $setup = Get-ChildItem "target/release/bundle/nsis" -Filter "*.exe" |
+            Select-Object -First 1
+          if (-not $setup) { throw "NSIS installer was not produced" }
+
+          $setupName = "cursor-byok-$version-current-windows-x64-setup.exe"
+          $portableName = "cursor-byok-$version-current-windows-x64-portable.exe"
+          $zipName = "cursor-byok-$version-current-windows-x64.zip"
+          $sumsName = "cursor-byok-$version-current-windows-x64-SHA256SUMS.txt"
+
+          Copy-Item $setup.FullName (Join-Path $out $setupName)
+          Copy-Item "target/release/cursor-byok-desktop.exe" (Join-Path $out $portableName)
+
+          $archiveInputs = @(
+            (Join-Path $out $setupName),
+            (Join-Path $out $portableName)
+          )
+          Compress-Archive -LiteralPath $archiveInputs -DestinationPath (Join-Path $out $zipName)
+
+          $sumLines = @()
+          foreach ($name in @($setupName, $portableName, $zipName)) {
+            $hash = (Get-FileHash (Join-Path $out $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            $sumLines += "$hash  $name"
+          }
+          Set-Content -Path (Join-Path $out $sumsName) -Value $sumLines -Encoding utf8
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cursor-byok-${{ steps.package.outputs.version }}-current-windows-x64
+          path: dist-windows/*
+          if-no-files-found: error
+          retention-days: 14
